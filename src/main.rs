@@ -18,58 +18,92 @@ struct CameraDragState {
     last_position: Option<Vec2>,
 }
 
+// Add a resource to track assets loading
+#[derive(Resource, Default)]
+struct GameAssets {
+    monkey: Handle<Image>,
+    wall: Handle<Image>,
+    floor: Handle<Image>,
+    roof: Handle<Image>,
+    loaded: bool,
+}
+
+// Define game states
+#[derive(States, Debug, Clone, Eq, PartialEq, Hash, Default)]
+enum GameState {
+    #[default]
+    Loading,
+    Ready,
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(Sprite3dPlugin)
-        .init_resource::<CameraDragState>() // Initialize the camera drag state
-        .add_systems(Startup, setup)
-        .add_systems(Update, (player_movement, camera_follow, camera_drag))
+        .init_resource::<CameraDragState>()
+        .init_resource::<GameAssets>()
+        .init_state::<GameState>()
+        .add_systems(Startup, load_assets)
+        .add_systems(Update, check_assets_ready.run_if(in_state(GameState::Loading)))
+        .add_systems(OnEnter(GameState::Ready), setup)
+        .add_systems(Update, (player_movement, camera_follow, camera_drag).run_if(in_state(GameState::Ready)))
         .run();
+}
+
+fn load_assets(mut game_assets: ResMut<GameAssets>, asset_server: Res<AssetServer>) {
+    info!("Loading assets...");
+    game_assets.monkey = asset_server.load("images/monkey.png");
+    game_assets.wall = asset_server.load("images/wall.png");
+    game_assets.floor = asset_server.load("images/floor.png");
+    game_assets.roof = asset_server.load("images/roof.png");
+}
+
+fn check_assets_ready(
+    mut game_assets: ResMut<GameAssets>,
+    asset_server: Res<AssetServer>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    // Check if all assets are loaded
+    let monkey_loaded = asset_server.get_load_state(&game_assets.monkey).is_some_and(|s| s.is_loaded());
+    let wall_loaded = asset_server.get_load_state(&game_assets.wall).is_some_and(|s| s.is_loaded());
+    let floor_loaded = asset_server.get_load_state(&game_assets.floor).is_some_and(|s| s.is_loaded());
+    let roof_loaded = asset_server.get_load_state(&game_assets.roof).is_some_and(|s| s.is_loaded());
+    
+    if monkey_loaded && wall_loaded && floor_loaded && roof_loaded {
+        info!("All assets loaded successfully!");
+        game_assets.loaded = true;
+        next_state.set(GameState::Ready);
+    } else {
+        // Log which assets are still loading
+        if !monkey_loaded { info!("Monkey texture still loading..."); }
+        if !wall_loaded { info!("Wall texture still loading..."); }
+        if !floor_loaded { info!("Floor texture still loading..."); }
+        if !roof_loaded { info!("Roof texture still loading..."); }
+    }
 }
 
 fn setup(
     mut commands: Commands,
-    asset_server: Res<AssetServer>,
+    game_assets: Res<GameAssets>,
     mut sprite_params: Sprite3dParams,
 ) {
-    info!("Loading textures...");
-    let monkey_texture = asset_server.load("images/monkey.png");
-    let wall_texture = asset_server.load("images/wall.png");
-    let floor_texture = asset_server.load("images/floor.png");
-    let roof_texture = asset_server.load("images/roof.png");
-
-    // Log the loaded textures
-    info!("Textures loaded: monkey");
-    
-    info!("Loading assets...");
-    
-    // Block until the monkey texture is loaded
-    info!("Waiting for monkey texture to load...");
-    let mut loaded = false;
-    while !loaded {
-        let load_state = asset_server.get_load_state(&monkey_texture);
-        if load_state.is_some() && load_state.unwrap().is_loaded() {
-            loaded = true;
-            info!("Monkey texture loaded successfully!");
-        } else {
-            info!("Monkey texture is still loading...");
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-
-    // Log the loaded textures
-    info!("All textures loaded: monkey, wall, floor, roof");
+    info!("Setting up game...");
     
     // Create maze
-    let (start_x, start_y) = create_maze(&mut commands, wall_texture, floor_texture, roof_texture, &mut sprite_params);
+    let (start_x, start_y) = create_maze(
+        &mut commands, 
+        game_assets.wall.clone(), 
+        game_assets.floor.clone(), 
+        game_assets.roof.clone(),
+        &mut sprite_params
+    );
 
     // Log the starting position of the monkey
     info!("Monkey starting position: ({}, {})", start_x, start_y);
 
     // Spawn the monkey sprite at the starting position using Sprite3d
     let monkey_sprite = Sprite3dBuilder {
-        image: monkey_texture,
+        image: game_assets.monkey.clone(),
         pixels_per_metre: 32.0,
         alpha_mode: AlphaMode::Mask(0.5),
         unlit: false,
@@ -171,11 +205,13 @@ fn camera_follow(
     }
 }
 
-// Keep the existing player_movement system
+// Fix the player_movement system to use ParamSet
 fn player_movement(
     keyboard: Res<ButtonInput<KeyCode>>,
-    mut player_query: Query<&mut Transform, With<Player>>,
-    wall_query: Query<&Transform, With<Wall>>,
+    mut param_set: ParamSet<(
+        Query<(Entity, &mut Transform), With<Player>>,
+        Query<&Transform, With<Wall>>,
+    )>,
 ) {
     // Get player direction
     let mut direction = Vec3::ZERO;
@@ -186,10 +222,10 @@ fn player_movement(
         direction.z -= 1.0; // Move backward
     }
     if keyboard.pressed(KeyCode::KeyA) {
-        direction.x -= 1.0; // Move left
+        direction.x += 1.0; // Move left
     }
     if keyboard.pressed(KeyCode::KeyD) {
-        direction.x += 1.0; // Move right
+        direction.x -= 1.0; // Move right
     }
 
     if direction.length() <= 0.0 {
@@ -201,24 +237,41 @@ fn player_movement(
     // Get player position and calculate new position
     let speed = 2.0;
     
-    if let Ok(mut player_transform) = player_query.get_single_mut() {
-        let current_pos = player_transform.translation;
-        let new_pos = current_pos + direction * speed;
+    // First, get the player position
+    let mut player_pos = Vec3::ZERO;
+    let mut player_entity = None;
+    
+    for (entity, transform) in param_set.p0().iter_mut() {
+        player_pos = transform.translation;
+        player_entity = Some(entity);
+        break;
+    }
+    
+    if player_entity.is_none() {
+        return;
+    }
+    
+    let new_pos = player_pos + direction * speed;
+    
+    // Check for collisions
+    let mut collision = false;
+    // for wall_transform in param_set.p1().iter() {
+    //     let wall_pos = wall_transform.translation;
+    //     let distance = Vec2::new(new_pos.x - wall_pos.x, new_pos.z - wall_pos.z).length();
         
-        // Simple collision detection
-        let mut collision = false;
-        for wall_transform in wall_query.iter() {
-            let wall_pos = wall_transform.translation;
-            let distance = Vec2::new(new_pos.x - wall_pos.x, new_pos.z - wall_pos.z).length();
-            
-            if distance < 24.0 { // Approximate collision radius
-                collision = true;
-                break;
+    //     if distance < 24.0 { // Approximate collision radius
+    //         collision = true;
+    //         break;
+    //     }
+    // }
+    
+    // Update player position if no collision
+    if !collision {
+        if let Some(entity) = player_entity {
+            let mut player_transforms = param_set.p0();
+            if let Ok((_, mut transform)) = player_transforms.get_mut(entity) {
+                transform.translation = new_pos;
             }
-        }
-        
-        if !collision {
-            player_transform.translation = new_pos;
         }
     }
 }
