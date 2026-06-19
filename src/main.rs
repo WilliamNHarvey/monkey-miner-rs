@@ -27,9 +27,19 @@ struct Rat {
     last_direction: Option<Direction>,
 }
 
+#[derive(Component)]
+struct TrailMarker;
+
 #[derive(Resource, Default)]
 struct RunState {
     won: bool,
+}
+
+#[derive(Resource)]
+struct TrailMarkers {
+    marked: [[bool; MAZE_COLUMNS]; MAZE_ROWS],
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
 }
 
 #[derive(Resource)]
@@ -101,6 +111,7 @@ fn main() {
             Update,
             (
                 player_movement,
+                drop_trail_marker,
                 rat_movement,
                 camera_drag,
                 camera_follow,
@@ -193,6 +204,17 @@ fn setup(
 
     info!("Monkey starting position: {:?}", start_position);
 
+    commands.insert_resource(TrailMarkers {
+        marked: [[false; MAZE_COLUMNS]; MAZE_ROWS],
+        mesh: meshes.add(Cuboid::new(22.0, 2.0, 22.0)),
+        material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.05, 0.85, 1.0),
+            emissive: LinearRgba::rgb(0.0, 0.45, 0.75),
+            perceptual_roughness: 0.65,
+            ..default()
+        }),
+    });
+
     let monkey_sprite = Sprite3d {
         pixels_per_metre: 12.0,
         alpha_mode: AlphaMode::Mask(0.5),
@@ -268,6 +290,38 @@ fn setup(
             .looking_at(start_position + Vec3::Y * 24.0, Vec3::Y),
         FollowCamera,
     ));
+}
+
+fn drop_trail_marker(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    player_query: Query<&Transform, With<Player>>,
+    mut markers: ResMut<TrailMarkers>,
+    mut commands: Commands,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyT) {
+        return;
+    }
+
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let Some(cell) = world_to_cell(player_transform.translation) else {
+        return;
+    };
+    if markers.marked[cell.1][cell.0] {
+        info!("Trail marker already exists at cell {:?}", cell);
+        return;
+    }
+
+    markers.marked[cell.1][cell.0] = true;
+    let center = cell_center(cell.0, cell.1);
+    commands.spawn((
+        Mesh3d(markers.mesh.clone()),
+        MeshMaterial3d(markers.material.clone()),
+        Transform::from_xyz(center.x, 1.4, center.y),
+        TrailMarker,
+    ));
+    info!("Dropped trail marker at cell {:?}", cell);
 }
 
 fn check_exit_reached(
