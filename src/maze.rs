@@ -31,6 +31,13 @@ pub struct WallCollider {
     pub half_extents: Vec2,
 }
 
+#[derive(Component, Clone, Copy)]
+pub struct WallSegment {
+    pub cell: (usize, usize),
+    pub direction: Direction,
+    pub mineable: bool,
+}
+
 #[derive(Resource, Clone)]
 pub struct MazeMap {
     pub cells: [[MazeCell; MAZE_COLUMNS]; MAZE_ROWS],
@@ -179,6 +186,9 @@ pub fn create_maze(
                     wall_material.clone(),
                     Vec2::new(center.x, center.y + CELL_SIZE * 0.5),
                     Vec2::new((CELL_SIZE + WALL_THICKNESS) * 0.5, WALL_THICKNESS * 0.5),
+                    (x, z),
+                    Direction::North,
+                    z < MAZE_ROWS - 1,
                     false,
                 );
             }
@@ -189,6 +199,9 @@ pub fn create_maze(
                     wall_material.clone(),
                     Vec2::new(center.x - CELL_SIZE * 0.5, center.y),
                     Vec2::new(WALL_THICKNESS * 0.5, (CELL_SIZE + WALL_THICKNESS) * 0.5),
+                    (x, z),
+                    Direction::West,
+                    x > 0,
                     true,
                 );
             }
@@ -199,6 +212,9 @@ pub fn create_maze(
                     wall_material.clone(),
                     Vec2::new(center.x, center.y - CELL_SIZE * 0.5),
                     Vec2::new((CELL_SIZE + WALL_THICKNESS) * 0.5, WALL_THICKNESS * 0.5),
+                    (x, z),
+                    Direction::South,
+                    false,
                     false,
                 );
             }
@@ -209,6 +225,9 @@ pub fn create_maze(
                     wall_material.clone(),
                     Vec2::new(center.x + CELL_SIZE * 0.5, center.y),
                     Vec2::new(WALL_THICKNESS * 0.5, (CELL_SIZE + WALL_THICKNESS) * 0.5),
+                    (x, z),
+                    Direction::East,
+                    false,
                     true,
                 );
             }
@@ -245,6 +264,9 @@ fn spawn_wall(
     material: Handle<StandardMaterial>,
     center: Vec2,
     half_extents: Vec2,
+    cell: (usize, usize),
+    direction: Direction,
+    mineable: bool,
     vertical: bool,
 ) {
     commands.spawn((
@@ -255,6 +277,11 @@ fn spawn_wall(
         WallCollider {
             center,
             half_extents,
+        },
+        WallSegment {
+            cell,
+            direction,
+            mineable,
         },
     ));
 

@@ -4,8 +4,8 @@ use bevy_sprite3d::prelude::*;
 use rand::seq::SliceRandom;
 mod maze;
 use maze::{
-    Direction, FogCell, MAZE_COLUMNS, MAZE_ROWS, MazeMap, WallCollider, cell_center, create_maze,
-    world_to_cell,
+    Direction, FogCell, MAZE_COLUMNS, MAZE_ROWS, MazeMap, WallCollider, WallSegment, cell_center,
+    create_maze, world_to_cell,
 };
 
 #[derive(Component)]
@@ -36,6 +36,11 @@ struct Treasure {
 }
 
 #[derive(Component)]
+struct Ore {
+    value: u32,
+}
+
+#[derive(Component)]
 struct HudText;
 
 #[derive(Resource, Default)]
@@ -43,6 +48,8 @@ struct RunState {
     won: bool,
     treasure: u32,
     total_treasure: u32,
+    ore: u32,
+    mined_walls: u32,
 }
 
 #[derive(Resource)]
@@ -50,6 +57,12 @@ struct TrailMarkers {
     marked: [[bool; MAZE_COLUMNS]; MAZE_ROWS],
     mesh: Handle<Mesh>,
     material: Handle<StandardMaterial>,
+}
+
+#[derive(Resource)]
+struct MiningAssets {
+    ore_mesh: Handle<Mesh>,
+    ore_material: Handle<StandardMaterial>,
 }
 
 #[derive(Resource)]
@@ -122,11 +135,13 @@ fn main() {
             (
                 player_movement,
                 drop_trail_marker,
+                mine_wall,
                 rat_movement,
                 camera_drag,
                 camera_follow,
                 update_fog,
                 collect_treasure,
+                collect_ore,
                 update_hud,
                 check_exit_reached,
             )
@@ -218,6 +233,8 @@ fn setup(
     info!("Monkey starting position: {:?}", start_position);
 
     run_state.treasure = 0;
+    run_state.ore = 0;
+    run_state.mined_walls = 0;
     run_state.won = false;
 
     commands.insert_resource(TrailMarkers {
@@ -227,6 +244,16 @@ fn setup(
             base_color: Color::srgb(0.05, 0.85, 1.0),
             emissive: LinearRgba::rgb(0.0, 0.45, 0.75),
             perceptual_roughness: 0.65,
+            ..default()
+        }),
+    });
+
+    commands.insert_resource(MiningAssets {
+        ore_mesh: meshes.add(Cuboid::new(14.0, 14.0, 14.0)),
+        ore_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.95, 0.38, 0.08),
+            emissive: LinearRgba::rgb(0.5, 0.12, 0.0),
+            perceptual_roughness: 0.55,
             ..default()
         }),
     });
@@ -439,6 +466,30 @@ fn collect_treasure(
     }
 }
 
+fn collect_ore(
+    mut commands: Commands,
+    player_query: Query<&Transform, With<Player>>,
+    ore_query: Query<(Entity, &Transform, &Ore)>,
+    mut run_state: ResMut<RunState>,
+) {
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let player_xz = Vec2::new(
+        player_transform.translation.x,
+        player_transform.translation.z,
+    );
+
+    for (entity, transform, ore) in ore_query.iter() {
+        let ore_xz = Vec2::new(transform.translation.x, transform.translation.z);
+        if player_xz.distance(ore_xz) < 28.0 {
+            run_state.ore += ore.value;
+            commands.entity(entity).despawn();
+            info!("Collected ore {}", run_state.ore);
+        }
+    }
+}
+
 fn update_hud(run_state: Res<RunState>, mut hud_query: Query<&mut Text, With<HudText>>) {
     if !run_state.is_changed() {
         return;
@@ -457,9 +508,120 @@ fn hud_text(run_state: &RunState) -> String {
         "Find the smiley exit"
     };
     format!(
-        "Treasure: {}/{}\nT: drop trail marker\n{}",
-        run_state.treasure, run_state.total_treasure, objective
+        "Treasure: {}/{}  Ore: {}  Mined: {}\nQ/E: turn  T: marker  F: mine\n{}",
+        run_state.treasure,
+        run_state.total_treasure,
+        run_state.ore,
+        run_state.mined_walls,
+        objective
     )
+}
+
+fn mine_wall(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    player_query: Query<&Transform, With<Player>>,
+    orbit: Res<CameraOrbit>,
+    mut maze: ResMut<MazeMap>,
+    wall_query: Query<(Entity, &WallSegment, &WallCollider)>,
+    mining_assets: Res<MiningAssets>,
+    mut run_state: ResMut<RunState>,
+    mut commands: Commands,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyF) {
+        return;
+    }
+
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let Some(cell) = world_to_cell(player_transform.translation) else {
+        return;
+    };
+    let direction = facing_direction(orbit.yaw);
+    if !maze.cells[cell.1][cell.0].walls[direction.index()] {
+        info!(
+            "No wall to mine at cell {:?} facing {:?}",
+            cell,
+            direction.index()
+        );
+        return;
+    }
+
+    let Some((entity, segment, collider)) = wall_query
+        .iter()
+        .find(|(_, segment, _)| same_wall_edge(segment.cell, segment.direction, cell, direction))
+    else {
+        info!(
+            "No wall entity found at cell {:?} facing {:?}",
+            cell,
+            direction.index()
+        );
+        return;
+    };
+
+    if !segment.mineable {
+        info!("Boundary wall cannot be mined at cell {:?}", cell);
+        return;
+    }
+
+    commands.entity(entity).despawn();
+    maze.cells[cell.1][cell.0].walls[direction.index()] = false;
+    if let Some(neighbor) = neighbor_cell(cell, direction) {
+        maze.cells[neighbor.1][neighbor.0].walls[direction.opposite().index()] = false;
+    }
+    commands.spawn((
+        Mesh3d(mining_assets.ore_mesh.clone()),
+        MeshMaterial3d(mining_assets.ore_material.clone()),
+        Transform::from_xyz(collider.center.x, 12.0, collider.center.y),
+        Ore { value: 1 },
+    ));
+    run_state.mined_walls += 1;
+    info!(
+        "Mined wall at cell {:?} facing {:?}",
+        cell,
+        direction.index()
+    );
+}
+
+fn facing_direction(yaw: f32) -> Direction {
+    let forward = Vec2::new(-yaw.sin(), -yaw.cos());
+    if forward.x.abs() > forward.y.abs() {
+        if forward.x > 0.0 {
+            Direction::East
+        } else {
+            Direction::West
+        }
+    } else if forward.y > 0.0 {
+        Direction::North
+    } else {
+        Direction::South
+    }
+}
+
+fn same_wall_edge(
+    segment_cell: (usize, usize),
+    segment_direction: Direction,
+    cell: (usize, usize),
+    direction: Direction,
+) -> bool {
+    if segment_cell == cell && segment_direction == direction {
+        return true;
+    }
+
+    neighbor_cell(cell, direction).is_some_and(|neighbor| {
+        segment_cell == neighbor && segment_direction == direction.opposite()
+    })
+}
+
+fn neighbor_cell(cell: (usize, usize), direction: Direction) -> Option<(usize, usize)> {
+    let (dx, dz) = direction.delta();
+    let nx = cell.0 as isize + dx;
+    let nz = cell.1 as isize + dz;
+    if nx < 0 || nz < 0 || nx >= MAZE_COLUMNS as isize || nz >= MAZE_ROWS as isize {
+        return None;
+    }
+
+    Some((nx as usize, nz as usize))
 }
 
 fn drop_trail_marker(
@@ -610,10 +772,20 @@ fn direction_between(from: (usize, usize), to: (usize, usize)) -> Option<Directi
 }
 
 fn camera_drag(
+    keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     mut mouse_motion: MessageReader<MouseMotion>,
+    time: Res<Time>,
     mut orbit: ResMut<CameraOrbit>,
 ) {
+    let keyboard_rotation = 2.4 * time.delta_secs();
+    if keyboard.pressed(KeyCode::KeyQ) {
+        orbit.yaw = (orbit.yaw - keyboard_rotation).rem_euclid(std::f32::consts::TAU);
+    }
+    if keyboard.pressed(KeyCode::KeyE) {
+        orbit.yaw = (orbit.yaw + keyboard_rotation).rem_euclid(std::f32::consts::TAU);
+    }
+
     let mut total_motion = Vec2::ZERO;
     for event in mouse_motion.read() {
         total_motion += event.delta;
