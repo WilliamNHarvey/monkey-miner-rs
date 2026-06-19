@@ -2,6 +2,7 @@ use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
 use bevy_sprite3d::prelude::*;
 use rand::seq::SliceRandom;
+use std::collections::VecDeque;
 mod maze;
 use maze::{
     Direction, FogCell, MAZE_COLUMNS, MAZE_ROWS, MazeMap, WallCollider, WallSegment, cell_center,
@@ -25,6 +26,7 @@ struct Rat {
     cell: (usize, usize),
     target_cell: (usize, usize),
     last_direction: Option<Direction>,
+    hunting: bool,
 }
 
 #[derive(Component)]
@@ -62,6 +64,7 @@ struct RunState {
     keys: u32,
     doors_unlocked: u32,
     chests_opened: u32,
+    caught_by_rat: bool,
 }
 
 #[derive(Resource)]
@@ -253,6 +256,7 @@ fn setup(
     run_state.keys = 0;
     run_state.doors_unlocked = 0;
     run_state.chests_opened = 0;
+    run_state.caught_by_rat = false;
     run_state.won = false;
 
     commands.insert_resource(TrailMarkers {
@@ -364,8 +368,10 @@ fn setup(
             cell: rat_cell,
             target_cell: rat_cell,
             last_direction: None,
+            hunting: false,
         },
     ));
+    info!("Rat enemy spawned at cell {:?}", rat_cell);
 
     commands.insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
@@ -703,6 +709,8 @@ fn update_hud(run_state: Res<RunState>, mut hud_query: Query<&mut Text, With<Hud
 fn hud_text(run_state: &RunState) -> String {
     let objective = if run_state.won {
         "Escaped!"
+    } else if run_state.caught_by_rat {
+        "Caught by the rat!"
     } else {
         "Find the smiley exit"
     };
@@ -892,11 +900,42 @@ fn check_exit_reached(
 fn rat_movement(
     time: Res<Time>,
     maze: Res<MazeMap>,
+    player_query: Query<&Transform, (With<Player>, Without<Rat>)>,
     mut rat_query: Query<(&mut Transform, &mut Rat)>,
+    mut run_state: ResMut<RunState>,
 ) {
+    if run_state.won || run_state.caught_by_rat {
+        return;
+    }
+
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let player_cell = world_to_cell(player_transform.translation);
+    let player_xz = Vec2::new(
+        player_transform.translation.x,
+        player_transform.translation.z,
+    );
+
     for (mut transform, mut rat) in rat_query.iter_mut() {
+        let rat_xz = Vec2::new(transform.translation.x, transform.translation.z);
+        if rat_xz.distance(player_xz) < 24.0 {
+            run_state.caught_by_rat = true;
+            info!("Caught by the rat at cell {:?}", rat.cell);
+            return;
+        }
+
         if rat.cell == rat.target_cell {
-            rat.target_cell = choose_rat_target(rat.cell, rat.last_direction, &maze);
+            if let Some(player_cell) = player_cell {
+                if !rat.hunting {
+                    rat.hunting = true;
+                    info!("Rat picked up the trail");
+                }
+                rat.target_cell = next_step_toward(rat.cell, player_cell, &maze)
+                    .unwrap_or_else(|| choose_rat_target(rat.cell, rat.last_direction, &maze));
+            } else {
+                rat.target_cell = choose_rat_target(rat.cell, rat.last_direction, &maze);
+            }
         }
 
         let target_center = cell_center(rat.target_cell.0, rat.target_cell.1);
@@ -909,15 +948,53 @@ fn rat_movement(
                 rat.last_direction = direction_between(rat.cell, rat.target_cell);
                 rat.cell = rat.target_cell;
             }
-            rat.target_cell = choose_rat_target(rat.cell, rat.last_direction, &maze);
+            rat.target_cell = rat.cell;
             continue;
         }
 
-        let step = 68.0 * time.delta_secs();
+        let step = 92.0 * time.delta_secs();
         let movement = to_target.normalize() * step.min(distance);
         transform.translation += movement;
         transform.rotation = Quat::from_rotation_y(movement.x.atan2(movement.z));
     }
+}
+
+fn next_step_toward(
+    start: (usize, usize),
+    goal: (usize, usize),
+    maze: &MazeMap,
+) -> Option<(usize, usize)> {
+    if start == goal {
+        return Some(goal);
+    }
+
+    let mut visited = [[false; MAZE_COLUMNS]; MAZE_ROWS];
+    let mut previous = [[None; MAZE_COLUMNS]; MAZE_ROWS];
+    let mut queue = VecDeque::new();
+    visited[start.1][start.0] = true;
+    queue.push_back(start);
+
+    while let Some(cell) = queue.pop_front() {
+        for next in open_neighbors(cell, maze) {
+            if visited[next.1][next.0] {
+                continue;
+            }
+            visited[next.1][next.0] = true;
+            previous[next.1][next.0] = Some(cell);
+            if next == goal {
+                let mut step = next;
+                while let Some(prev) = previous[step.1][step.0] {
+                    if prev == start {
+                        return Some(step);
+                    }
+                    step = prev;
+                }
+            }
+            queue.push_back(next);
+        }
+    }
+
+    None
 }
 
 fn choose_rat_target(
@@ -1044,9 +1121,14 @@ fn player_movement(
     keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     orbit: Res<CameraOrbit>,
+    run_state: Res<RunState>,
     mut player_query: Query<&mut Transform, With<Player>>,
     wall_query: Query<&WallCollider>,
 ) {
+    if run_state.won || run_state.caught_by_rat {
+        return;
+    }
+
     let forward = Vec3::new(-orbit.yaw.sin(), 0.0, -orbit.yaw.cos()).normalize();
     let right = Vec3::new(-forward.z, 0.0, forward.x).normalize();
     let mut direction = Vec3::ZERO;
