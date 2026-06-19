@@ -1203,10 +1203,10 @@ fn camera_drag(
 ) {
     let keyboard_rotation = 2.4 * time.delta_secs();
     if keyboard.pressed(KeyCode::KeyQ) {
-        orbit.yaw = (orbit.yaw - keyboard_rotation).rem_euclid(std::f32::consts::TAU);
+        orbit.yaw = (orbit.yaw + keyboard_rotation).rem_euclid(std::f32::consts::TAU);
     }
     if keyboard.pressed(KeyCode::KeyE) {
-        orbit.yaw = (orbit.yaw + keyboard_rotation).rem_euclid(std::f32::consts::TAU);
+        orbit.yaw = (orbit.yaw - keyboard_rotation).rem_euclid(std::f32::consts::TAU);
     }
 
     let mut total_motion = Vec2::ZERO;
