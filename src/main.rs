@@ -41,6 +41,15 @@ struct Ore {
 }
 
 #[derive(Component)]
+struct KeyPickup;
+
+#[derive(Component)]
+struct LockedDoor;
+
+#[derive(Component)]
+struct Chest;
+
+#[derive(Component)]
 struct HudText;
 
 #[derive(Resource, Default)]
@@ -50,6 +59,9 @@ struct RunState {
     total_treasure: u32,
     ore: u32,
     mined_walls: u32,
+    keys: u32,
+    doors_unlocked: u32,
+    chests_opened: u32,
 }
 
 #[derive(Resource)]
@@ -142,6 +154,9 @@ fn main() {
                 update_fog,
                 collect_treasure,
                 collect_ore,
+                collect_key,
+                unlock_door,
+                open_chest,
                 update_hud,
                 check_exit_reached,
             )
@@ -235,6 +250,9 @@ fn setup(
     run_state.treasure = 0;
     run_state.ore = 0;
     run_state.mined_walls = 0;
+    run_state.keys = 0;
+    run_state.doors_unlocked = 0;
+    run_state.chests_opened = 0;
     run_state.won = false;
 
     commands.insert_resource(TrailMarkers {
@@ -273,6 +291,13 @@ fn setup(
         start_position,
     );
     run_state.total_treasure = total_treasure;
+    spawn_key_door_and_chests(
+        &mut commands,
+        &maze_map,
+        start_position,
+        &mut meshes,
+        &mut materials,
+    );
 
     commands.spawn((
         Text::new(hud_text(&run_state)),
@@ -439,6 +464,102 @@ fn open_neighbors(cell: (usize, usize), maze: &MazeMap) -> Vec<(usize, usize)> {
         .collect()
 }
 
+fn spawn_key_door_and_chests(
+    commands: &mut Commands,
+    maze: &MazeMap,
+    start_position: Vec3,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let start_cell = world_to_cell(start_position).unwrap_or((0, 0));
+    let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
+    let key_cell = open_neighbors(start_cell, maze)
+        .into_iter()
+        .find(|cell| *cell != exit_cell)
+        .unwrap_or(start_cell);
+    let key_center = cell_center(key_cell.0, key_cell.1);
+    let key_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.92, 0.1),
+        emissive: LinearRgba::rgb(0.45, 0.32, 0.0),
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(18.0, 6.0, 10.0))),
+        MeshMaterial3d(key_material),
+        Transform::from_xyz(key_center.x + 18.0, 8.0, key_center.y),
+        KeyPickup,
+    ));
+    info!("Key spawned at cell {:?}", key_cell);
+
+    if let Some(door_neighbor) = open_neighbors(exit_cell, maze).first().copied() {
+        if let Some(door_direction) = direction_between(door_neighbor, exit_cell) {
+            let door_center = edge_center(door_neighbor, door_direction);
+            let vertical = matches!(door_direction, Direction::East | Direction::West);
+            let door_mesh = if vertical {
+                meshes.add(Cuboid::new(8.0, 62.0, 56.0))
+            } else {
+                meshes.add(Cuboid::new(56.0, 62.0, 8.0))
+            };
+            let half_extents = if vertical {
+                Vec2::new(4.0, 28.0)
+            } else {
+                Vec2::new(28.0, 4.0)
+            };
+            let door_material = materials.add(StandardMaterial {
+                base_color: Color::srgb(0.05, 0.22, 0.95),
+                emissive: LinearRgba::rgb(0.0, 0.04, 0.35),
+                perceptual_roughness: 0.35,
+                ..default()
+            });
+            commands.spawn((
+                Mesh3d(door_mesh),
+                MeshMaterial3d(door_material),
+                Transform::from_xyz(door_center.x, 31.0, door_center.y),
+                WallCollider {
+                    center: door_center,
+                    half_extents,
+                },
+                LockedDoor,
+            ));
+            info!("Locked door spawned before exit at cell {:?}", exit_cell);
+        }
+    }
+
+    let chest_mesh = meshes.add(Cuboid::new(22.0, 18.0, 18.0));
+    let chest_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.48, 0.22, 0.08),
+        emissive: LinearRgba::rgb(0.12, 0.05, 0.01),
+        perceptual_roughness: 0.7,
+        ..default()
+    });
+    let mut spawned_chests = 0;
+    for z in 0..MAZE_ROWS {
+        for x in 0..MAZE_COLUMNS {
+            if spawned_chests >= 3
+                || (x, z) == start_cell
+                || (x, z) == exit_cell
+                || (x, z) == key_cell
+            {
+                continue;
+            }
+            let open_edges = maze.cells[z][x].walls.iter().filter(|wall| !**wall).count();
+            if open_edges != 1 {
+                continue;
+            }
+
+            let center = cell_center(x, z);
+            commands.spawn((
+                Mesh3d(chest_mesh.clone()),
+                MeshMaterial3d(chest_material.clone()),
+                Transform::from_xyz(center.x, 10.0, center.y),
+                Chest,
+            ));
+            spawned_chests += 1;
+        }
+    }
+    info!("Spawned {spawned_chests} chests");
+}
+
 fn collect_treasure(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
@@ -490,6 +611,84 @@ fn collect_ore(
     }
 }
 
+fn collect_key(
+    mut commands: Commands,
+    player_query: Query<&Transform, With<Player>>,
+    key_query: Query<(Entity, &Transform), With<KeyPickup>>,
+    mut run_state: ResMut<RunState>,
+) {
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let player_xz = Vec2::new(
+        player_transform.translation.x,
+        player_transform.translation.z,
+    );
+    for (entity, transform) in key_query.iter() {
+        let key_xz = Vec2::new(transform.translation.x, transform.translation.z);
+        if player_xz.distance(key_xz) < 30.0 {
+            run_state.keys += 1;
+            commands.entity(entity).despawn();
+            info!("Collected key; keys={}", run_state.keys);
+        }
+    }
+}
+
+fn unlock_door(
+    mut commands: Commands,
+    player_query: Query<&Transform, With<Player>>,
+    door_query: Query<(Entity, &WallCollider), With<LockedDoor>>,
+    mut run_state: ResMut<RunState>,
+) {
+    if run_state.keys == 0 {
+        return;
+    }
+
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let player_xz = Vec2::new(
+        player_transform.translation.x,
+        player_transform.translation.z,
+    );
+    for (entity, collider) in door_query.iter() {
+        if player_xz.distance(collider.center) < 58.0 {
+            run_state.keys -= 1;
+            run_state.doors_unlocked += 1;
+            commands.entity(entity).despawn();
+            info!("Unlocked exit door");
+        }
+    }
+}
+
+fn open_chest(
+    mut commands: Commands,
+    player_query: Query<&Transform, With<Player>>,
+    chest_query: Query<(Entity, &Transform), With<Chest>>,
+    mut run_state: ResMut<RunState>,
+) {
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let player_xz = Vec2::new(
+        player_transform.translation.x,
+        player_transform.translation.z,
+    );
+    for (entity, transform) in chest_query.iter() {
+        let chest_xz = Vec2::new(transform.translation.x, transform.translation.z);
+        if player_xz.distance(chest_xz) < 32.0 {
+            run_state.treasure += 2;
+            run_state.ore += 1;
+            run_state.chests_opened += 1;
+            commands.entity(entity).despawn();
+            info!(
+                "Opened chest {}; +2 treasure, +1 ore",
+                run_state.chests_opened
+            );
+        }
+    }
+}
+
 fn update_hud(run_state: Res<RunState>, mut hud_query: Query<&mut Text, With<HudText>>) {
     if !run_state.is_changed() {
         return;
@@ -508,10 +707,11 @@ fn hud_text(run_state: &RunState) -> String {
         "Find the smiley exit"
     };
     format!(
-        "Treasure: {}/{}  Ore: {}  Mined: {}\nQ/E: turn  T: marker  F: mine\n{}",
+        "Treasure: {}/{}  Ore: {}  Keys: {}  Mined: {}\nQ/E: turn  T: marker  F: mine\n{}",
         run_state.treasure,
         run_state.total_treasure,
         run_state.ore,
+        run_state.keys,
         run_state.mined_walls,
         objective
     )
@@ -622,6 +822,12 @@ fn neighbor_cell(cell: (usize, usize), direction: Direction) -> Option<(usize, u
     }
 
     Some((nx as usize, nz as usize))
+}
+
+fn edge_center(cell: (usize, usize), direction: Direction) -> Vec2 {
+    let center = cell_center(cell.0, cell.1);
+    let (dx, dz) = direction.delta();
+    center + Vec2::new(dx as f32, dz as f32) * (maze::CELL_SIZE * 0.5)
 }
 
 fn drop_trail_marker(
