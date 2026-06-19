@@ -5,8 +5,8 @@ use rand::seq::SliceRandom;
 use std::collections::VecDeque;
 mod maze;
 use maze::{
-    Direction, FogCell, MAZE_COLUMNS, MAZE_ROWS, MazeMap, WallCollider, WallSegment, cell_center,
-    create_maze, world_to_cell,
+    Direction, Floor, FogCell, MAZE_COLUMNS, MAZE_ROWS, MazeMap, Roof, Wall, WallCollider,
+    WallSegment, cell_center, create_maze, world_to_cell,
 };
 
 #[derive(Component)]
@@ -68,6 +68,10 @@ struct RunState {
     energy: u32,
     max_energy: u32,
     pickaxe_level: u32,
+    elapsed_seconds: f32,
+    score: u32,
+    best_score: u32,
+    score_finalized: bool,
 }
 
 #[derive(Resource)]
@@ -131,6 +135,7 @@ enum GameState {
     #[default]
     Loading,
     Ready,
+    Restarting,
 }
 
 fn main() {
@@ -148,9 +153,11 @@ fn main() {
             check_assets_ready.run_if(in_state(GameState::Loading)),
         )
         .add_systems(OnEnter(GameState::Ready), setup)
+        .add_systems(OnEnter(GameState::Restarting), cleanup_run)
         .add_systems(
             Update,
             (
+                update_run_timer,
                 player_movement,
                 drop_trail_marker,
                 mine_wall,
@@ -164,6 +171,9 @@ fn main() {
                 unlock_door,
                 open_chest,
                 upgrade_pickaxe,
+                update_score,
+                finalize_score,
+                restart_run,
                 update_hud,
                 check_exit_reached,
             )
@@ -264,6 +274,9 @@ fn setup(
     run_state.max_energy = 3;
     run_state.energy = run_state.max_energy;
     run_state.pickaxe_level = 1;
+    run_state.elapsed_seconds = 0.0;
+    run_state.score = 0;
+    run_state.score_finalized = false;
     run_state.won = false;
 
     commands.insert_resource(TrailMarkers {
@@ -403,6 +416,87 @@ fn setup(
             .looking_at(start_position + Vec3::Y * 24.0, Vec3::Y),
         FollowCamera,
     ));
+}
+
+fn cleanup_run(
+    mut commands: Commands,
+    run_entities: Query<
+        Entity,
+        Or<(
+            With<Player>,
+            With<FollowCamera>,
+            With<PlayerLight>,
+            With<Exit>,
+            With<Rat>,
+            With<TrailMarker>,
+            With<Treasure>,
+            With<Ore>,
+            With<KeyPickup>,
+            With<LockedDoor>,
+            With<Chest>,
+            With<HudText>,
+        )>,
+    >,
+    maze_entities: Query<Entity, Or<(With<Wall>, With<Floor>, With<Roof>, With<FogCell>)>>,
+    mut fog_memory: ResMut<FogMemory>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    for entity in run_entities.iter().chain(maze_entities.iter()) {
+        commands.entity(entity).despawn();
+    }
+    fog_memory.seen = [[false; MAZE_COLUMNS]; MAZE_ROWS];
+    next_state.set(GameState::Ready);
+    info!("Restarting run");
+}
+
+fn update_run_timer(time: Res<Time>, mut run_state: ResMut<RunState>) {
+    if run_state.won || run_state.caught_by_rat {
+        return;
+    }
+    run_state.elapsed_seconds += time.delta_secs();
+}
+
+fn score_for(run_state: &RunState) -> u32 {
+    let base = run_state.treasure * 100
+        + run_state.ore * 25
+        + run_state.keys * 20
+        + run_state.doors_unlocked * 150
+        + run_state.chests_opened * 75
+        + run_state.mined_walls * 10;
+    let win_bonus = if run_state.won { 1_000 } else { 0 };
+    let time_penalty = run_state.elapsed_seconds as u32;
+    (base + win_bonus).saturating_sub(time_penalty)
+}
+
+fn update_score(mut run_state: ResMut<RunState>) {
+    if run_state.score_finalized {
+        return;
+    }
+    run_state.score = score_for(&run_state);
+}
+
+fn finalize_score(mut run_state: ResMut<RunState>) {
+    if run_state.score_finalized || (!run_state.won && !run_state.caught_by_rat) {
+        return;
+    }
+
+    run_state.score = score_for(&run_state);
+    run_state.best_score = run_state.best_score.max(run_state.score);
+    run_state.score_finalized = true;
+    info!(
+        "Final score {}; best {}",
+        run_state.score, run_state.best_score
+    );
+}
+
+fn restart_run(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    run_state: Res<RunState>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    if keyboard.just_pressed(KeyCode::KeyR) && (run_state.won || run_state.caught_by_rat) {
+        next_state.set(GameState::Restarting);
+    }
 }
 
 fn spawn_treasures(
@@ -722,7 +816,7 @@ fn hud_text(run_state: &RunState) -> String {
         "Find the smiley exit"
     };
     format!(
-        "Treasure: {}/{}  Ore: {}  Keys: {}  Energy: {}/{}\nPickaxe: {}  Mined: {}\nQ/E: turn  T: marker  F: mine  U: upgrade\n{}",
+        "Treasure: {}/{}  Ore: {}  Keys: {}  Energy: {}/{}\nPickaxe: {}  Mined: {}  Time: {:.0}s\nScore: {}  Best: {}\nQ/E: turn  T: marker  F: mine  U: upgrade{}\n{}",
         run_state.treasure,
         run_state.total_treasure,
         run_state.ore,
@@ -731,6 +825,14 @@ fn hud_text(run_state: &RunState) -> String {
         run_state.max_energy,
         run_state.pickaxe_level,
         run_state.mined_walls,
+        run_state.elapsed_seconds,
+        run_state.score,
+        run_state.best_score,
+        if run_state.won || run_state.caught_by_rat {
+            "  R: restart"
+        } else {
+            ""
+        },
         objective
     )
 }
