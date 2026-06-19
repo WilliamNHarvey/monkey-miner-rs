@@ -54,6 +54,9 @@ struct Chest;
 #[derive(Component)]
 struct HudText;
 
+#[derive(Component)]
+struct Billboard;
+
 #[derive(Resource, Default)]
 struct RunState {
     won: bool,
@@ -77,14 +80,12 @@ struct RunState {
 #[derive(Resource)]
 struct TrailMarkers {
     marked: [[bool; MAZE_COLUMNS]; MAZE_ROWS],
-    mesh: Handle<Mesh>,
-    material: Handle<StandardMaterial>,
+    image: Handle<Image>,
 }
 
 #[derive(Resource)]
 struct MiningAssets {
-    ore_mesh: Handle<Mesh>,
-    ore_material: Handle<StandardMaterial>,
+    ore_image: Handle<Image>,
 }
 
 #[derive(Resource)]
@@ -126,6 +127,20 @@ struct GameAssets {
     roof: Handle<Image>,
     smiley_exit: Handle<Image>,
     rat: Handle<Image>,
+    treasure: Handle<Image>,
+    ore: Handle<Image>,
+    key: Handle<Image>,
+    locked_door: Handle<Image>,
+    chest: Handle<Image>,
+    trail_marker: Handle<Image>,
+    pickup_sound: Handle<AudioSource>,
+    mine_sound: Handle<AudioSource>,
+    unlock_sound: Handle<AudioSource>,
+    chest_sound: Handle<AudioSource>,
+    upgrade_sound: Handle<AudioSource>,
+    marker_sound: Handle<AudioSource>,
+    catch_sound: Handle<AudioSource>,
+    win_sound: Handle<AudioSource>,
     loaded: bool,
 }
 
@@ -140,7 +155,14 @@ enum GameState {
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
+        .add_plugins(
+            DefaultPlugins
+                .set(AssetPlugin {
+                    file_path: asset_file_path(),
+                    ..default()
+                })
+                .set(ImagePlugin::default_nearest()),
+        )
         .add_plugins(Sprite3dPlugin)
         .init_resource::<CameraOrbit>()
         .init_resource::<FogMemory>()
@@ -164,6 +186,7 @@ fn main() {
                 rat_movement,
                 camera_drag,
                 camera_follow,
+                billboard_to_camera,
                 update_fog,
                 collect_treasure,
                 collect_ore,
@@ -182,6 +205,26 @@ fn main() {
         .run();
 }
 
+fn asset_file_path() -> String {
+    if let Some(packaged_assets) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("assets")))
+        .filter(|assets| assets.join("images/monkey.png").is_file())
+    {
+        return packaged_assets.to_string_lossy().into_owned();
+    }
+
+    if let Some(source_assets) = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.join("assets"))
+        .filter(|assets| assets.join("images/monkey.png").is_file())
+    {
+        return source_assets.to_string_lossy().into_owned();
+    }
+
+    "assets".to_string()
+}
+
 fn load_assets(mut game_assets: ResMut<GameAssets>, asset_server: Res<AssetServer>) {
     info!("Loading assets...");
     game_assets.monkey = asset_server.load("images/monkey.png");
@@ -190,6 +233,30 @@ fn load_assets(mut game_assets: ResMut<GameAssets>, asset_server: Res<AssetServe
     game_assets.roof = asset_server.load("images/roof.png");
     game_assets.smiley_exit = asset_server.load("images/smiley_exit.png");
     game_assets.rat = asset_server.load("images/rat.png");
+    game_assets.treasure = asset_server.load("images/treasure.png");
+    game_assets.ore = asset_server.load("images/ore.png");
+    game_assets.key = asset_server.load("images/key.png");
+    game_assets.locked_door = asset_server.load("images/locked_door.png");
+    game_assets.chest = asset_server.load("images/chest.png");
+    game_assets.trail_marker = asset_server.load("images/trail_marker.png");
+    game_assets.pickup_sound = asset_server.load("audio/pickup.ogg");
+    game_assets.mine_sound = asset_server.load("audio/mine.ogg");
+    game_assets.unlock_sound = asset_server.load("audio/unlock.ogg");
+    game_assets.chest_sound = asset_server.load("audio/chest.ogg");
+    game_assets.upgrade_sound = asset_server.load("audio/upgrade.ogg");
+    game_assets.marker_sound = asset_server.load("audio/marker.ogg");
+    game_assets.catch_sound = asset_server.load("audio/catch.ogg");
+    game_assets.win_sound = asset_server.load("audio/win.ogg");
+}
+
+fn asset_loaded<T: Asset>(asset_server: &AssetServer, handle: &Handle<T>, label: &str) -> bool {
+    let loaded = asset_server
+        .get_load_state(handle)
+        .is_some_and(|state| state.is_loaded());
+    if !loaded {
+        info!("{label} still loading...");
+    }
+    loaded
 }
 
 fn check_assets_ready(
@@ -197,50 +264,39 @@ fn check_assets_ready(
     asset_server: Res<AssetServer>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
-    // Check if all assets are loaded
-    let monkey_loaded = asset_server
-        .get_load_state(&game_assets.monkey)
-        .is_some_and(|s| s.is_loaded());
-    let wall_loaded = asset_server
-        .get_load_state(&game_assets.wall)
-        .is_some_and(|s| s.is_loaded());
-    let floor_loaded = asset_server
-        .get_load_state(&game_assets.floor)
-        .is_some_and(|s| s.is_loaded());
-    let roof_loaded = asset_server
-        .get_load_state(&game_assets.roof)
-        .is_some_and(|s| s.is_loaded());
-    let smiley_loaded = asset_server
-        .get_load_state(&game_assets.smiley_exit)
-        .is_some_and(|s| s.is_loaded());
-    let rat_loaded = asset_server
-        .get_load_state(&game_assets.rat)
-        .is_some_and(|s| s.is_loaded());
+    let images_loaded = [
+        ("Monkey texture", &game_assets.monkey),
+        ("Wall texture", &game_assets.wall),
+        ("Floor texture", &game_assets.floor),
+        ("Roof texture", &game_assets.roof),
+        ("Smiley exit texture", &game_assets.smiley_exit),
+        ("Rat texture", &game_assets.rat),
+        ("Treasure texture", &game_assets.treasure),
+        ("Ore texture", &game_assets.ore),
+        ("Key texture", &game_assets.key),
+        ("Locked door texture", &game_assets.locked_door),
+        ("Chest texture", &game_assets.chest),
+        ("Trail marker texture", &game_assets.trail_marker),
+    ]
+    .into_iter()
+    .all(|(label, handle)| asset_loaded(&asset_server, handle, label));
+    let sounds_loaded = [
+        ("Pickup sound", &game_assets.pickup_sound),
+        ("Mine sound", &game_assets.mine_sound),
+        ("Unlock sound", &game_assets.unlock_sound),
+        ("Chest sound", &game_assets.chest_sound),
+        ("Upgrade sound", &game_assets.upgrade_sound),
+        ("Marker sound", &game_assets.marker_sound),
+        ("Catch sound", &game_assets.catch_sound),
+        ("Win sound", &game_assets.win_sound),
+    ]
+    .into_iter()
+    .all(|(label, handle)| asset_loaded(&asset_server, handle, label));
 
-    if monkey_loaded && wall_loaded && floor_loaded && roof_loaded && smiley_loaded && rat_loaded {
+    if images_loaded && sounds_loaded {
         info!("All assets loaded successfully!");
         game_assets.loaded = true;
         next_state.set(GameState::Ready);
-    } else {
-        // Log which assets are still loading
-        if !monkey_loaded {
-            info!("Monkey texture still loading...");
-        }
-        if !wall_loaded {
-            info!("Wall texture still loading...");
-        }
-        if !floor_loaded {
-            info!("Floor texture still loading...");
-        }
-        if !roof_loaded {
-            info!("Roof texture still loading...");
-        }
-        if !smiley_loaded {
-            info!("Smiley exit texture still loading...");
-        }
-        if !rat_loaded {
-            info!("Rat texture still loading...");
-        }
     }
 }
 
@@ -281,37 +337,17 @@ fn setup(
 
     commands.insert_resource(TrailMarkers {
         marked: [[false; MAZE_COLUMNS]; MAZE_ROWS],
-        mesh: meshes.add(Cuboid::new(22.0, 2.0, 22.0)),
-        material: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.05, 0.85, 1.0),
-            emissive: LinearRgba::rgb(0.0, 0.45, 0.75),
-            perceptual_roughness: 0.65,
-            ..default()
-        }),
+        image: game_assets.trail_marker.clone(),
     });
 
     commands.insert_resource(MiningAssets {
-        ore_mesh: meshes.add(Cuboid::new(14.0, 14.0, 14.0)),
-        ore_material: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.95, 0.38, 0.08),
-            emissive: LinearRgba::rgb(0.5, 0.12, 0.0),
-            perceptual_roughness: 0.55,
-            ..default()
-        }),
+        ore_image: game_assets.ore.clone(),
     });
 
-    let treasure_mesh = meshes.add(Cuboid::new(16.0, 16.0, 16.0));
-    let treasure_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.78, 0.05),
-        emissive: LinearRgba::rgb(0.55, 0.32, 0.0),
-        perceptual_roughness: 0.45,
-        ..default()
-    });
     let total_treasure = spawn_treasures(
         &mut commands,
         &maze_map,
-        treasure_mesh,
-        treasure_material,
+        game_assets.treasure.clone(),
         start_position,
     );
     run_state.total_treasure = total_treasure;
@@ -319,6 +355,7 @@ fn setup(
         &mut commands,
         &maze_map,
         start_position,
+        &game_assets,
         &mut meshes,
         &mut materials,
     );
@@ -369,6 +406,7 @@ fn setup(
         },
         Transform::from_translation(exit_position),
         Exit,
+        Billboard,
     ));
 
     let rat_cell = (MAZE_COLUMNS / 2, MAZE_ROWS / 2);
@@ -502,8 +540,7 @@ fn restart_run(
 fn spawn_treasures(
     commands: &mut Commands,
     maze: &MazeMap,
-    mesh: Handle<Mesh>,
-    material: Handle<StandardMaterial>,
+    image: Handle<Image>,
     start_position: Vec3,
 ) -> u32 {
     let start_cell = world_to_cell(start_position).unwrap_or((0, 0));
@@ -540,10 +577,11 @@ fn spawn_treasures(
     for cell in treasure_cells {
         let center = cell_center(cell.0, cell.1);
         commands.spawn((
-            Mesh3d(mesh.clone()),
-            MeshMaterial3d(material.clone()),
-            Transform::from_xyz(center.x, 12.0, center.y),
+            Sprite::from_image(image.clone()),
+            item_sprite(3.2),
+            Transform::from_xyz(center.x, 2.0, center.y),
             Treasure { value: 1 },
+            Billboard,
         ));
         spawned += 1;
     }
@@ -575,6 +613,7 @@ fn spawn_key_door_and_chests(
     commands: &mut Commands,
     maze: &MazeMap,
     start_position: Vec3,
+    game_assets: &GameAssets,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) {
@@ -585,16 +624,12 @@ fn spawn_key_door_and_chests(
         .find(|cell| *cell != exit_cell)
         .unwrap_or(start_cell);
     let key_center = cell_center(key_cell.0, key_cell.1);
-    let key_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.92, 0.1),
-        emissive: LinearRgba::rgb(0.45, 0.32, 0.0),
-        ..default()
-    });
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(18.0, 6.0, 10.0))),
-        MeshMaterial3d(key_material),
-        Transform::from_xyz(key_center.x + 18.0, 8.0, key_center.y),
+        Sprite::from_image(game_assets.key.clone()),
+        item_sprite(2.6),
+        Transform::from_xyz(key_center.x + 18.0, 2.0, key_center.y),
         KeyPickup,
+        Billboard,
     ));
     info!("Key spawned at cell {:?}", key_cell);
 
@@ -613,8 +648,9 @@ fn spawn_key_door_and_chests(
                 Vec2::new(28.0, 4.0)
             };
             let door_material = materials.add(StandardMaterial {
-                base_color: Color::srgb(0.05, 0.22, 0.95),
-                emissive: LinearRgba::rgb(0.0, 0.04, 0.35),
+                base_color_texture: Some(game_assets.locked_door.clone()),
+                base_color: Color::WHITE,
+                emissive: LinearRgba::rgb(0.0, 0.02, 0.12),
                 perceptual_roughness: 0.35,
                 ..default()
             });
@@ -632,13 +668,6 @@ fn spawn_key_door_and_chests(
         }
     }
 
-    let chest_mesh = meshes.add(Cuboid::new(22.0, 18.0, 18.0));
-    let chest_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.48, 0.22, 0.08),
-        emissive: LinearRgba::rgb(0.12, 0.05, 0.01),
-        perceptual_roughness: 0.7,
-        ..default()
-    });
     let mut spawned_chests = 0;
     for z in 0..MAZE_ROWS {
         for x in 0..MAZE_COLUMNS {
@@ -656,10 +685,11 @@ fn spawn_key_door_and_chests(
 
             let center = cell_center(x, z);
             commands.spawn((
-                Mesh3d(chest_mesh.clone()),
-                MeshMaterial3d(chest_material.clone()),
-                Transform::from_xyz(center.x, 10.0, center.y),
+                Sprite::from_image(game_assets.chest.clone()),
+                item_sprite(2.6),
+                Transform::from_xyz(center.x, 2.0, center.y),
                 Chest,
+                Billboard,
             ));
             spawned_chests += 1;
         }
@@ -667,10 +697,26 @@ fn spawn_key_door_and_chests(
     info!("Spawned {spawned_chests} chests");
 }
 
+fn item_sprite(pixels_per_metre: f32) -> Sprite3d {
+    Sprite3d {
+        pixels_per_metre,
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        double_sided: true,
+        pivot: Some(Vec2::new(0.5, 0.08)),
+        ..Default::default()
+    }
+}
+
+fn play_sound(commands: &mut Commands, sound: Handle<AudioSource>) {
+    commands.spawn((AudioPlayer(sound), PlaybackSettings::DESPAWN));
+}
+
 fn collect_treasure(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
     treasure_query: Query<(Entity, &Transform, &Treasure)>,
+    game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
 ) {
     let Ok(player_transform) = player_query.single() else {
@@ -686,6 +732,7 @@ fn collect_treasure(
         if player_xz.distance(treasure_xz) < 28.0 {
             run_state.treasure += treasure.value;
             commands.entity(entity).despawn();
+            play_sound(&mut commands, game_assets.pickup_sound.clone());
             info!(
                 "Collected treasure {}/{}",
                 run_state.treasure, run_state.total_treasure
@@ -698,6 +745,7 @@ fn collect_ore(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
     ore_query: Query<(Entity, &Transform, &Ore)>,
+    game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
 ) {
     let Ok(player_transform) = player_query.single() else {
@@ -713,6 +761,7 @@ fn collect_ore(
         if player_xz.distance(ore_xz) < 28.0 {
             run_state.ore += ore.value;
             commands.entity(entity).despawn();
+            play_sound(&mut commands, game_assets.pickup_sound.clone());
             info!("Collected ore {}", run_state.ore);
         }
     }
@@ -722,6 +771,7 @@ fn collect_key(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
     key_query: Query<(Entity, &Transform), With<KeyPickup>>,
+    game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
 ) {
     let Ok(player_transform) = player_query.single() else {
@@ -736,6 +786,7 @@ fn collect_key(
         if player_xz.distance(key_xz) < 30.0 {
             run_state.keys += 1;
             commands.entity(entity).despawn();
+            play_sound(&mut commands, game_assets.pickup_sound.clone());
             info!("Collected key; keys={}", run_state.keys);
         }
     }
@@ -745,6 +796,7 @@ fn unlock_door(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
     door_query: Query<(Entity, &WallCollider), With<LockedDoor>>,
+    game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
 ) {
     if run_state.keys == 0 {
@@ -763,6 +815,7 @@ fn unlock_door(
             run_state.keys -= 1;
             run_state.doors_unlocked += 1;
             commands.entity(entity).despawn();
+            play_sound(&mut commands, game_assets.unlock_sound.clone());
             info!("Unlocked exit door");
         }
     }
@@ -772,6 +825,7 @@ fn open_chest(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
     chest_query: Query<(Entity, &Transform), With<Chest>>,
+    game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
 ) {
     let Ok(player_transform) = player_query.single() else {
@@ -788,6 +842,7 @@ fn open_chest(
             run_state.ore += 1;
             run_state.chests_opened += 1;
             commands.entity(entity).despawn();
+            play_sound(&mut commands, game_assets.chest_sound.clone());
             info!(
                 "Opened chest {}; +2 treasure, +1 ore",
                 run_state.chests_opened
@@ -837,7 +892,12 @@ fn hud_text(run_state: &RunState) -> String {
     )
 }
 
-fn upgrade_pickaxe(keyboard: Res<ButtonInput<KeyCode>>, mut run_state: ResMut<RunState>) {
+fn upgrade_pickaxe(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    game_assets: Res<GameAssets>,
+    mut run_state: ResMut<RunState>,
+    mut commands: Commands,
+) {
     if !keyboard.just_pressed(KeyCode::KeyU) || run_state.won || run_state.caught_by_rat {
         return;
     }
@@ -852,6 +912,7 @@ fn upgrade_pickaxe(keyboard: Res<ButtonInput<KeyCode>>, mut run_state: ResMut<Ru
     run_state.pickaxe_level += 1;
     run_state.max_energy += 1;
     run_state.energy = run_state.max_energy;
+    play_sound(&mut commands, game_assets.upgrade_sound.clone());
     info!(
         "Upgraded pickaxe to level {}; max energy {}",
         run_state.pickaxe_level, run_state.max_energy
@@ -865,6 +926,7 @@ fn mine_wall(
     mut maze: ResMut<MazeMap>,
     wall_query: Query<(Entity, &WallSegment, &WallCollider)>,
     mining_assets: Res<MiningAssets>,
+    game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
     mut commands: Commands,
 ) {
@@ -915,15 +977,17 @@ fn mine_wall(
         maze.cells[neighbor.1][neighbor.0].walls[direction.opposite().index()] = false;
     }
     commands.spawn((
-        Mesh3d(mining_assets.ore_mesh.clone()),
-        MeshMaterial3d(mining_assets.ore_material.clone()),
-        Transform::from_xyz(collider.center.x, 12.0, collider.center.y),
+        Sprite::from_image(mining_assets.ore_image.clone()),
+        item_sprite(2.4),
+        Transform::from_xyz(collider.center.x, 2.0, collider.center.y),
         Ore {
             value: run_state.pickaxe_level,
         },
+        Billboard,
     ));
     run_state.energy -= 1;
     run_state.mined_walls += 1;
+    play_sound(&mut commands, game_assets.mine_sound.clone());
     info!(
         "Mined wall at cell {:?} facing {:?}",
         cell,
@@ -982,6 +1046,7 @@ fn drop_trail_marker(
     keyboard: Res<ButtonInput<KeyCode>>,
     player_query: Query<&Transform, With<Player>>,
     mut markers: ResMut<TrailMarkers>,
+    game_assets: Res<GameAssets>,
     mut commands: Commands,
 ) {
     if !keyboard.just_pressed(KeyCode::KeyT) {
@@ -1002,17 +1067,21 @@ fn drop_trail_marker(
     markers.marked[cell.1][cell.0] = true;
     let center = cell_center(cell.0, cell.1);
     commands.spawn((
-        Mesh3d(markers.mesh.clone()),
-        MeshMaterial3d(markers.material.clone()),
-        Transform::from_xyz(center.x, 1.4, center.y),
+        Sprite::from_image(markers.image.clone()),
+        item_sprite(3.0),
+        Transform::from_xyz(center.x, 1.0, center.y),
         TrailMarker,
+        Billboard,
     ));
+    play_sound(&mut commands, game_assets.marker_sound.clone());
     info!("Dropped trail marker at cell {:?}", cell);
 }
 
 fn check_exit_reached(
+    mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
     exit_query: Query<&Transform, With<Exit>>,
+    game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
 ) {
     if run_state.won {
@@ -1033,15 +1102,18 @@ fn check_exit_reached(
     let exit_xz = Vec2::new(exit_transform.translation.x, exit_transform.translation.z);
     if player_xz.distance(exit_xz) < 32.0 {
         run_state.won = true;
+        play_sound(&mut commands, game_assets.win_sound.clone());
         info!("You found the smiley face exit!");
     }
 }
 
 fn rat_movement(
+    mut commands: Commands,
     time: Res<Time>,
     maze: Res<MazeMap>,
     player_query: Query<&Transform, (With<Player>, Without<Rat>)>,
     mut rat_query: Query<(&mut Transform, &mut Rat)>,
+    game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
 ) {
     if run_state.won || run_state.caught_by_rat {
@@ -1061,6 +1133,7 @@ fn rat_movement(
         let rat_xz = Vec2::new(transform.translation.x, transform.translation.z);
         if rat_xz.distance(player_xz) < 24.0 {
             run_state.caught_by_rat = true;
+            play_sound(&mut commands, game_assets.catch_sound.clone());
             info!("Caught by the rat at cell {:?}", rat.cell);
             return;
         }
@@ -1254,6 +1327,23 @@ fn camera_follow(
         if let Ok(mut light_transform) = light_query.single_mut() {
             light_transform.translation = player_transform.translation + Vec3::Y * 38.0;
         }
+    }
+}
+
+fn billboard_to_camera(
+    camera_query: Query<&Transform, (With<FollowCamera>, Without<Billboard>)>,
+    mut billboard_query: Query<&mut Transform, (With<Billboard>, Without<FollowCamera>)>,
+) {
+    let Ok(camera_transform) = camera_query.single() else {
+        return;
+    };
+
+    for mut transform in billboard_query.iter_mut() {
+        let to_camera = camera_transform.translation - transform.translation;
+        if to_camera.xz().length_squared() < 0.01 {
+            continue;
+        }
+        transform.rotation = Quat::from_rotation_y(to_camera.x.atan2(to_camera.z));
     }
 }
 
