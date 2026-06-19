@@ -65,6 +65,9 @@ struct RunState {
     doors_unlocked: u32,
     chests_opened: u32,
     caught_by_rat: bool,
+    energy: u32,
+    max_energy: u32,
+    pickaxe_level: u32,
 }
 
 #[derive(Resource)]
@@ -160,6 +163,7 @@ fn main() {
                 collect_key,
                 unlock_door,
                 open_chest,
+                upgrade_pickaxe,
                 update_hud,
                 check_exit_reached,
             )
@@ -257,6 +261,9 @@ fn setup(
     run_state.doors_unlocked = 0;
     run_state.chests_opened = 0;
     run_state.caught_by_rat = false;
+    run_state.max_energy = 3;
+    run_state.energy = run_state.max_energy;
+    run_state.pickaxe_level = 1;
     run_state.won = false;
 
     commands.insert_resource(TrailMarkers {
@@ -715,14 +722,38 @@ fn hud_text(run_state: &RunState) -> String {
         "Find the smiley exit"
     };
     format!(
-        "Treasure: {}/{}  Ore: {}  Keys: {}  Mined: {}\nQ/E: turn  T: marker  F: mine\n{}",
+        "Treasure: {}/{}  Ore: {}  Keys: {}  Energy: {}/{}\nPickaxe: {}  Mined: {}\nQ/E: turn  T: marker  F: mine  U: upgrade\n{}",
         run_state.treasure,
         run_state.total_treasure,
         run_state.ore,
         run_state.keys,
+        run_state.energy,
+        run_state.max_energy,
+        run_state.pickaxe_level,
         run_state.mined_walls,
         objective
     )
+}
+
+fn upgrade_pickaxe(keyboard: Res<ButtonInput<KeyCode>>, mut run_state: ResMut<RunState>) {
+    if !keyboard.just_pressed(KeyCode::KeyU) || run_state.won || run_state.caught_by_rat {
+        return;
+    }
+
+    let cost = run_state.pickaxe_level;
+    if run_state.ore < cost {
+        info!("Need {cost} ore to upgrade pickaxe");
+        return;
+    }
+
+    run_state.ore -= cost;
+    run_state.pickaxe_level += 1;
+    run_state.max_energy += 1;
+    run_state.energy = run_state.max_energy;
+    info!(
+        "Upgraded pickaxe to level {}; max energy {}",
+        run_state.pickaxe_level, run_state.max_energy
+    );
 }
 
 fn mine_wall(
@@ -736,6 +767,10 @@ fn mine_wall(
     mut commands: Commands,
 ) {
     if !keyboard.just_pressed(KeyCode::KeyF) {
+        return;
+    }
+    if run_state.energy == 0 {
+        info!("Out of mining energy; upgrade your pickaxe with ore");
         return;
     }
 
@@ -781,8 +816,11 @@ fn mine_wall(
         Mesh3d(mining_assets.ore_mesh.clone()),
         MeshMaterial3d(mining_assets.ore_material.clone()),
         Transform::from_xyz(collider.center.x, 12.0, collider.center.y),
-        Ore { value: 1 },
+        Ore {
+            value: run_state.pickaxe_level,
+        },
     ));
+    run_state.energy -= 1;
     run_state.mined_walls += 1;
     info!(
         "Mined wall at cell {:?} facing {:?}",
