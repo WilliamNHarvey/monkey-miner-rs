@@ -30,9 +30,19 @@ struct Rat {
 #[derive(Component)]
 struct TrailMarker;
 
+#[derive(Component)]
+struct Treasure {
+    value: u32,
+}
+
+#[derive(Component)]
+struct HudText;
+
 #[derive(Resource, Default)]
 struct RunState {
     won: bool,
+    treasure: u32,
+    total_treasure: u32,
 }
 
 #[derive(Resource)]
@@ -116,6 +126,8 @@ fn main() {
                 camera_drag,
                 camera_follow,
                 update_fog,
+                collect_treasure,
+                update_hud,
                 check_exit_reached,
             )
                 .run_if(in_state(GameState::Ready)),
@@ -188,12 +200,13 @@ fn check_assets_ready(
 fn setup(
     mut commands: Commands,
     game_assets: Res<GameAssets>,
+    mut run_state: ResMut<RunState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     info!("Setting up game...");
 
-    let start_position = create_maze(
+    let (start_position, maze_map) = create_maze(
         &mut commands,
         game_assets.wall.clone(),
         game_assets.floor.clone(),
@@ -203,6 +216,9 @@ fn setup(
     );
 
     info!("Monkey starting position: {:?}", start_position);
+
+    run_state.treasure = 0;
+    run_state.won = false;
 
     commands.insert_resource(TrailMarkers {
         marked: [[false; MAZE_COLUMNS]; MAZE_ROWS],
@@ -214,6 +230,38 @@ fn setup(
             ..default()
         }),
     });
+
+    let treasure_mesh = meshes.add(Cuboid::new(16.0, 16.0, 16.0));
+    let treasure_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.78, 0.05),
+        emissive: LinearRgba::rgb(0.55, 0.32, 0.0),
+        perceptual_roughness: 0.45,
+        ..default()
+    });
+    let total_treasure = spawn_treasures(
+        &mut commands,
+        &maze_map,
+        treasure_mesh,
+        treasure_material,
+        start_position,
+    );
+    run_state.total_treasure = total_treasure;
+
+    commands.spawn((
+        Text::new(hud_text(&run_state)),
+        TextFont {
+            font_size: 24.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.95, 0.95, 0.75)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(16.0),
+            top: Val::Px(14.0),
+            ..default()
+        },
+        HudText,
+    ));
 
     let monkey_sprite = Sprite3d {
         pixels_per_metre: 12.0,
@@ -292,6 +340,128 @@ fn setup(
     ));
 }
 
+fn spawn_treasures(
+    commands: &mut Commands,
+    maze: &MazeMap,
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+    start_position: Vec3,
+) -> u32 {
+    let start_cell = world_to_cell(start_position).unwrap_or((0, 0));
+    let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
+    let mut treasure_cells = Vec::new();
+    let mut spawned = 0;
+
+    if let Some(starter_cell) = open_neighbors(start_cell, maze)
+        .into_iter()
+        .find(|cell| *cell != exit_cell)
+    {
+        treasure_cells.push(starter_cell);
+        info!("Starter treasure at cell {:?}", starter_cell);
+    }
+
+    for z in 0..MAZE_ROWS {
+        for x in 0..MAZE_COLUMNS {
+            if (x, z) == start_cell || (x, z) == exit_cell {
+                continue;
+            }
+            if treasure_cells.contains(&(x, z)) {
+                continue;
+            }
+
+            let open_edges = maze.cells[z][x].walls.iter().filter(|wall| !**wall).count();
+            if open_edges != 1 {
+                continue;
+            }
+
+            treasure_cells.push((x, z));
+        }
+    }
+
+    for cell in treasure_cells {
+        let center = cell_center(cell.0, cell.1);
+        commands.spawn((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material.clone()),
+            Transform::from_xyz(center.x, 12.0, center.y),
+            Treasure { value: 1 },
+        ));
+        spawned += 1;
+    }
+
+    info!("Spawned {spawned} treasures");
+    spawned
+}
+
+fn open_neighbors(cell: (usize, usize), maze: &MazeMap) -> Vec<(usize, usize)> {
+    cardinal_directions()
+        .into_iter()
+        .filter_map(|(direction, dx, dz)| {
+            if maze.cells[cell.1][cell.0].walls[direction.index()] {
+                return None;
+            }
+
+            let nx = cell.0 as isize + dx;
+            let nz = cell.1 as isize + dz;
+            if nx < 0 || nz < 0 || nx >= MAZE_COLUMNS as isize || nz >= MAZE_ROWS as isize {
+                return None;
+            }
+
+            Some((nx as usize, nz as usize))
+        })
+        .collect()
+}
+
+fn collect_treasure(
+    mut commands: Commands,
+    player_query: Query<&Transform, With<Player>>,
+    treasure_query: Query<(Entity, &Transform, &Treasure)>,
+    mut run_state: ResMut<RunState>,
+) {
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let player_xz = Vec2::new(
+        player_transform.translation.x,
+        player_transform.translation.z,
+    );
+
+    for (entity, transform, treasure) in treasure_query.iter() {
+        let treasure_xz = Vec2::new(transform.translation.x, transform.translation.z);
+        if player_xz.distance(treasure_xz) < 28.0 {
+            run_state.treasure += treasure.value;
+            commands.entity(entity).despawn();
+            info!(
+                "Collected treasure {}/{}",
+                run_state.treasure, run_state.total_treasure
+            );
+        }
+    }
+}
+
+fn update_hud(run_state: Res<RunState>, mut hud_query: Query<&mut Text, With<HudText>>) {
+    if !run_state.is_changed() {
+        return;
+    }
+
+    let Ok(mut text) = hud_query.single_mut() else {
+        return;
+    };
+    text.0 = hud_text(&run_state);
+}
+
+fn hud_text(run_state: &RunState) -> String {
+    let objective = if run_state.won {
+        "Escaped!"
+    } else {
+        "Find the smiley exit"
+    };
+    format!(
+        "Treasure: {}/{}\nT: drop trail marker\n{}",
+        run_state.treasure, run_state.total_treasure, objective
+    )
+}
+
 fn drop_trail_marker(
     keyboard: Res<ButtonInput<KeyCode>>,
     player_query: Query<&Transform, With<Player>>,
@@ -340,7 +510,10 @@ fn check_exit_reached(
         return;
     };
 
-    let player_xz = Vec2::new(player_transform.translation.x, player_transform.translation.z);
+    let player_xz = Vec2::new(
+        player_transform.translation.x,
+        player_transform.translation.z,
+    );
     let exit_xz = Vec2::new(exit_transform.translation.x, exit_transform.translation.z);
     if player_xz.distance(exit_xz) < 32.0 {
         run_state.won = true;
@@ -348,7 +521,11 @@ fn check_exit_reached(
     }
 }
 
-fn rat_movement(time: Res<Time>, maze: Res<MazeMap>, mut rat_query: Query<(&mut Transform, &mut Rat)>) {
+fn rat_movement(
+    time: Res<Time>,
+    maze: Res<MazeMap>,
+    mut rat_query: Query<(&mut Transform, &mut Rat)>,
+) {
     for (mut transform, mut rat) in rat_query.iter_mut() {
         if rat.cell == rat.target_cell {
             rat.target_cell = choose_rat_target(rat.cell, rat.last_direction, &maze);
@@ -420,7 +597,10 @@ fn rat_neighbors(cell: (usize, usize), maze: &MazeMap) -> Vec<(Direction, (usize
 }
 
 fn direction_between(from: (usize, usize), to: (usize, usize)) -> Option<Direction> {
-    match (to.0 as isize - from.0 as isize, to.1 as isize - from.1 as isize) {
+    match (
+        to.0 as isize - from.0 as isize,
+        to.1 as isize - from.1 as isize,
+    ) {
         (0, 1) => Some(Direction::North),
         (1, 0) => Some(Direction::East),
         (0, -1) => Some(Direction::South),

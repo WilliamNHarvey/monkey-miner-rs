@@ -100,9 +100,10 @@ pub fn create_maze(
     roof_texture: Handle<Image>,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-) -> Vec3 {
+) -> (Vec3, MazeMap) {
     let maze = generate_connected_maze();
-    commands.insert_resource(MazeMap { cells: maze });
+    let maze_map = MazeMap { cells: maze };
+    commands.insert_resource(maze_map.clone());
 
     let wall_material = materials.add(StandardMaterial {
         base_color_texture: Some(wall_texture),
@@ -215,7 +216,7 @@ pub fn create_maze(
     }
 
     let start = cell_center(0, 0);
-    Vec3::new(start.x, 0.0, start.y)
+    (Vec3::new(start.x, 0.0, start.y), maze_map)
 }
 
 pub fn cell_center(x: usize, z: usize) -> Vec2 {
