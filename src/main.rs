@@ -1441,15 +1441,15 @@ fn collect_key(
 
 fn unlock_door(
     mut commands: Commands,
+    time: Res<Time>,
     player_query: Query<&Transform, With<Player>>,
     door_query: Query<(Entity, &WallCollider), With<LockedDoor>>,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
     mut navigation_state: ResMut<NavigationState>,
+    mut need_key_cooldown: Local<f32>,
 ) {
-    if run_state.keys == 0 {
-        return;
-    }
+    *need_key_cooldown = (*need_key_cooldown - time.delta_secs()).max(0.0);
 
     let Ok(player_transform) = player_query.single() else {
         return;
@@ -1460,6 +1460,13 @@ fn unlock_door(
     );
     for (entity, collider) in door_query.iter() {
         if player_xz.distance(collider.center) < 58.0 {
+            if run_state.keys == 0 {
+                if *need_key_cooldown <= 0.0 {
+                    spawn_floating_message(&mut commands, "Need the key!");
+                    *need_key_cooldown = 0.9;
+                }
+                return;
+            }
             run_state.keys -= 1;
             run_state.doors_unlocked += 1;
             navigation_state.door_unlocked = true;
@@ -1853,18 +1860,19 @@ fn mine_wall(
             cell,
             direction.index()
         );
-        spawn_unbreakable_message(&mut commands);
+        spawn_floating_message(&mut commands, "Unbreakable!");
         return;
     };
 
     if !segment.mineable {
         info!("Boundary wall cannot be mined at cell {:?}", cell);
-        spawn_unbreakable_message(&mut commands);
+        spawn_floating_message(&mut commands, "Unbreakable!");
         return;
     }
 
     if run_state.energy == 0 {
         info!("Out of mining energy; upgrade your pickaxe with ore");
+        spawn_floating_message(&mut commands, "Out of energy!");
         return;
     }
 
@@ -1915,9 +1923,9 @@ fn mine_wall(
     );
 }
 
-fn spawn_unbreakable_message(commands: &mut Commands) {
+fn spawn_floating_message(commands: &mut Commands, message: &'static str) {
     commands.spawn((
-        Text::new("Unbreakable!"),
+        Text::new(message),
         TextFont {
             font_size: 34.0,
             ..default()
@@ -2184,12 +2192,13 @@ fn drop_trail_marker(
     let Some(cell) = world_to_cell(player_transform.translation) else {
         return;
     };
-    if markers.marked[cell.1][cell.0] {
-        info!("Trail marker already exists at cell {:?}", cell);
-        return;
-    }
     if run_state.markers == 0 {
         info!("No trail markers left; collect treasure for more");
+        spawn_floating_message(&mut commands, "No more markers!");
+        return;
+    }
+    if markers.marked[cell.1][cell.0] {
+        info!("Trail marker already exists at cell {:?}", cell);
         return;
     }
 

@@ -8,6 +8,7 @@ pub const WALL_HEIGHT: f32 = 90.0;
 pub const WALL_THICKNESS: f32 = 10.0;
 pub const FLOOR_THICKNESS: f32 = 2.5;
 const FOG_HEIGHT: f32 = WALL_HEIGHT - 5.0;
+const VISUAL_WALL_LENGTH: f32 = CELL_SIZE - WALL_THICKNESS;
 
 #[derive(Component)]
 pub struct Wall;
@@ -154,16 +155,11 @@ pub fn create_maze(
     let floor_mesh = meshes.add(Cuboid::new(CELL_SIZE, FLOOR_THICKNESS, CELL_SIZE));
     let roof_mesh = meshes.add(Cuboid::new(CELL_SIZE, FLOOR_THICKNESS, CELL_SIZE));
     let fog_mesh = meshes.add(Cuboid::new(CELL_SIZE, FOG_HEIGHT, CELL_SIZE));
-    let horizontal_wall_mesh = meshes.add(Cuboid::new(
-        CELL_SIZE + WALL_THICKNESS,
-        WALL_HEIGHT,
-        WALL_THICKNESS,
-    ));
-    let vertical_wall_mesh = meshes.add(Cuboid::new(
-        WALL_THICKNESS,
-        WALL_HEIGHT,
-        CELL_SIZE + WALL_THICKNESS,
-    ));
+    let horizontal_wall_mesh =
+        meshes.add(Cuboid::new(VISUAL_WALL_LENGTH, WALL_HEIGHT, WALL_THICKNESS));
+    let vertical_wall_mesh =
+        meshes.add(Cuboid::new(WALL_THICKNESS, WALL_HEIGHT, VISUAL_WALL_LENGTH));
+    let wall_post_mesh = meshes.add(Cuboid::new(WALL_THICKNESS, WALL_HEIGHT, WALL_THICKNESS));
     let ore_deposit_edges = choose_ore_deposit_edges(&maze);
     info!("Spawned {} ore deposit walls", ore_deposit_edges.len());
 
@@ -279,9 +275,70 @@ pub fn create_maze(
             }
         }
     }
+    spawn_wall_posts(commands, wall_post_mesh, wall_material.clone(), &maze);
 
     let start = cell_center(0, 0);
     (Vec3::new(start.x, 0.0, start.y), maze_map)
+}
+
+fn spawn_wall_posts(
+    commands: &mut Commands,
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+    maze: &[[MazeCell; MAZE_COLUMNS]; MAZE_ROWS],
+) {
+    let width = MAZE_COLUMNS as f32 * CELL_SIZE;
+    let depth = MAZE_ROWS as f32 * CELL_SIZE;
+    for z in 0..=MAZE_ROWS {
+        for x in 0..=MAZE_COLUMNS {
+            if !wall_touches_vertex(x, z, maze) {
+                continue;
+            }
+            let position = Vec2::new(
+                x as f32 * CELL_SIZE - width * 0.5,
+                z as f32 * CELL_SIZE - depth * 0.5,
+            );
+            commands.spawn((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                Transform::from_xyz(position.x, WALL_HEIGHT * 0.5, position.y),
+                Wall,
+            ));
+        }
+    }
+}
+
+fn wall_touches_vertex(x: usize, z: usize, maze: &[[MazeCell; MAZE_COLUMNS]; MAZE_ROWS]) -> bool {
+    (x > 0 && horizontal_wall_at(x - 1, z, maze))
+        || (x < MAZE_COLUMNS && horizontal_wall_at(x, z, maze))
+        || (z > 0 && vertical_wall_at(x, z - 1, maze))
+        || (z < MAZE_ROWS && vertical_wall_at(x, z, maze))
+}
+
+fn horizontal_wall_at(
+    x: usize,
+    z_line: usize,
+    maze: &[[MazeCell; MAZE_COLUMNS]; MAZE_ROWS],
+) -> bool {
+    if x >= MAZE_COLUMNS || z_line > MAZE_ROWS {
+        return false;
+    }
+    if z_line == 0 {
+        maze[0][x].walls[Direction::South.index()]
+    } else {
+        maze[z_line - 1][x].walls[Direction::North.index()]
+    }
+}
+
+fn vertical_wall_at(x_line: usize, z: usize, maze: &[[MazeCell; MAZE_COLUMNS]; MAZE_ROWS]) -> bool {
+    if x_line > MAZE_COLUMNS || z >= MAZE_ROWS {
+        return false;
+    }
+    if x_line == 0 {
+        maze[z][0].walls[Direction::West.index()]
+    } else {
+        maze[z][x_line - 1].walls[Direction::East.index()]
+    }
 }
 
 pub fn cell_center(x: usize, z: usize) -> Vec2 {
