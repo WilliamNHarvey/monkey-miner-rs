@@ -51,12 +51,14 @@ Legend:
 | `#` | Wall |
 | `.` | Walkable corridor |
 | `P` | Player start |
-| `K` | Key spawn near start |
+| `K` | Key on the route to the exit |
 | `D` | Locked door before the exit |
 | `G` | Smiley exit goal |
 | `R` | Rat enemy |
 | `T` | Treasure |
 | `C` | Chest |
+| Compass | Unlocks the exit compass UI |
+| Map | Unlocks the treasure map UI |
 
 ## Controls
 
@@ -69,6 +71,7 @@ Legend:
 | `T` | Drop a trail marker in the current maze cell |
 | `F` | Mine the wall you are facing |
 | `U` | Open / close upgrade menu |
+| `M` | Open / close treasure map after finding it |
 | `Up` / `Down` | Select upgrade while the menu is open |
 | `Enter` / `Space` | Buy selected upgrade while the menu is open |
 | `Esc` | Close upgrade menu |
@@ -76,13 +79,13 @@ Legend:
 
 ## Mining And Upgrades
 
-Mining consumes energy. If energy hits zero, upgrade mining with ore to keep opening shortcuts. Ore can also be spent on movement speed if you want a faster escape route instead.
+Mining consumes energy. If energy hits zero, upgrade mining with ore to keep opening shortcuts. Ore comes from chests and special ore-deposit walls, and can also be spent on movement speed if you want a faster escape route instead.
 
 Upgrade rules:
 
 | Upgrade | Cost | Effect |
 | --- | --- | --- |
-| Mining energy | Current mining level in ore | Mining level +1, max energy +1, energy refills, mined walls drop more ore |
+| Mining energy | Current mining level in ore | Mining level +1, max energy +1, energy refills |
 | Movement speed | Current speed level in ore | Speed level +1, movement speed increases |
 
 ## Scoring

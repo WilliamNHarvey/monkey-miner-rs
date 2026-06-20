@@ -55,6 +55,12 @@ struct OreBurst {
 struct KeyPickup;
 
 #[derive(Component)]
+struct CompassPickup;
+
+#[derive(Component)]
+struct TreasureMapPickup;
+
+#[derive(Component)]
 struct LockedDoor;
 
 #[derive(Component)]
@@ -65,6 +71,12 @@ struct HudText;
 
 #[derive(Component)]
 struct UpgradeMenuText;
+
+#[derive(Component)]
+struct CompassText;
+
+#[derive(Component)]
+struct TreasureMapText;
 
 #[derive(Component)]
 struct StartScreenRoot;
@@ -80,6 +92,9 @@ struct WallShake {
 
 #[derive(Component)]
 struct Billboard;
+
+#[derive(Component)]
+struct RatAudioListener;
 
 #[derive(Resource, Default)]
 struct RunState {
@@ -113,6 +128,17 @@ struct TrailMarkers {
 #[derive(Resource)]
 struct HardWallAssets {
     textures: [Handle<Image>; 3],
+}
+
+#[derive(Resource, Default)]
+struct NavigationState {
+    key_cell: Option<(usize, usize)>,
+    compass_cell: Option<(usize, usize)>,
+    key_collected: bool,
+    compass_collected: bool,
+    treasure_map_collected: bool,
+    door_unlocked: bool,
+    show_treasure_map: bool,
 }
 
 #[derive(Resource)]
@@ -160,6 +186,8 @@ struct GameAssets {
     smiley_exit: Handle<Image>,
     rat: Handle<Image>,
     treasure: Handle<Image>,
+    treasure_map: Handle<Image>,
+    compass: Handle<Image>,
     ore: Handle<Image>,
     key: Handle<Image>,
     locked_door: Handle<Image>,
@@ -203,6 +231,7 @@ fn main() {
         .init_resource::<FogMemory>()
         .init_resource::<GameAssets>()
         .init_resource::<RunState>()
+        .init_resource::<NavigationState>()
         .init_state::<GameState>()
         .add_systems(Startup, load_assets)
         .add_systems(
@@ -227,8 +256,11 @@ fn main() {
                 update_ore_bursts,
                 update_wall_shake,
                 rat_movement,
-                rat_squeaks,
+                toggle_treasure_map,
                 camera_drag,
+                update_navigation_ui,
+                update_audio_listener,
+                rat_squeaks,
                 camera_follow,
                 billboard_to_camera,
                 update_fog,
@@ -240,6 +272,7 @@ fn main() {
             (
                 collect_treasure,
                 collect_ore,
+                collect_navigation_pickups,
                 collect_key,
                 unlock_door,
                 open_chest,
@@ -289,6 +322,8 @@ fn load_assets(mut game_assets: ResMut<GameAssets>, asset_server: Res<AssetServe
     game_assets.smiley_exit = asset_server.load("images/smiley_exit.png");
     game_assets.rat = asset_server.load("images/rat.png");
     game_assets.treasure = asset_server.load("images/treasure.png");
+    game_assets.treasure_map = asset_server.load("images/treasure_map.png");
+    game_assets.compass = asset_server.load("images/compass.png");
     game_assets.ore = asset_server.load("images/ore.png");
     game_assets.key = asset_server.load("images/key.png");
     game_assets.locked_door = asset_server.load("images/locked_door.png");
@@ -340,6 +375,8 @@ fn check_assets_ready(
         ("Smiley exit texture", &game_assets.smiley_exit),
         ("Rat texture", &game_assets.rat),
         ("Treasure texture", &game_assets.treasure),
+        ("Treasure map texture", &game_assets.treasure_map),
+        ("Compass texture", &game_assets.compass),
         ("Ore texture", &game_assets.ore),
         ("Key texture", &game_assets.key),
         ("Locked door texture", &game_assets.locked_door),
@@ -452,6 +489,7 @@ fn setup(
     mut commands: Commands,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
+    mut navigation_state: ResMut<NavigationState>,
     mut orbit: ResMut<CameraOrbit>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -503,6 +541,13 @@ fn setup(
     run_state.score = 0;
     run_state.score_finalized = false;
     run_state.won = false;
+    navigation_state.key_cell = None;
+    navigation_state.compass_cell = None;
+    navigation_state.key_collected = false;
+    navigation_state.compass_collected = false;
+    navigation_state.treasure_map_collected = false;
+    navigation_state.door_unlocked = false;
+    navigation_state.show_treasure_map = false;
 
     commands.insert_resource(TrailMarkers {
         marked: [[false; MAZE_COLUMNS]; MAZE_ROWS],
@@ -523,7 +568,7 @@ fn setup(
         game_assets.treasure.clone(),
         start_position,
     );
-    let chest_treasure = spawn_key_door_and_chests(
+    let (chest_treasure, key_cell) = spawn_key_door_and_chests(
         &mut commands,
         &maze_map,
         start_position,
@@ -531,10 +576,24 @@ fn setup(
         &mut meshes,
         &mut materials,
     );
+    navigation_state.key_cell = Some(key_cell);
+    info!("Navigation key target stored at cell {:?}", key_cell);
+    let (compass_cell, treasure_map_cell) = spawn_navigation_pickups(
+        &mut commands,
+        &maze_map,
+        start_position,
+        key_cell,
+        &game_assets,
+    );
+    navigation_state.compass_cell = Some(compass_cell);
+    info!(
+        "Navigation pickups spawned: compass {:?}, treasure map {:?}",
+        compass_cell, treasure_map_cell
+    );
     run_state.total_treasure = loose_treasure + chest_treasure;
 
     commands.spawn((
-        Text::new(hud_text(&run_state)),
+        Text::new(hud_text(&run_state, &navigation_state)),
         TextFont {
             font_size: 24.0,
             ..default()
@@ -559,10 +618,42 @@ fn setup(
         Node {
             position_type: PositionType::Absolute,
             right: Val::Px(20.0),
-            top: Val::Px(18.0),
+            bottom: Val::Px(20.0),
             ..default()
         },
         UpgradeMenuText,
+    ));
+
+    commands.spawn((
+        Text::new("COMPASS\nEXIT ?"),
+        TextFont {
+            font_size: 24.0,
+            ..default()
+        },
+        TextColor(Color::srgb(1.0, 0.86, 0.25)),
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(20.0),
+            top: Val::Px(18.0),
+            ..default()
+        },
+        CompassText,
+    ));
+
+    commands.spawn((
+        Text::new(String::new()),
+        TextFont {
+            font_size: 24.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.98, 0.80, 0.42)),
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(20.0),
+            top: Val::Px(135.0),
+            ..default()
+        },
+        TreasureMapText,
     ));
 
     let monkey_sprite = Sprite3d {
@@ -647,9 +738,15 @@ fn setup(
         orbit.yaw.cos() * horizontal_distance,
     );
     commands.spawn((
+        Transform::from_translation(start_position + Vec3::Y * 28.0)
+            .with_rotation(Quat::from_rotation_y(orbit.yaw)),
+        SpatialListener::new(30.0),
+        RatAudioListener,
+    ));
+
+    commands.spawn((
         Camera3d::default(),
         Transform::from_translation(target + camera_offset).looking_at(target, Vec3::Y),
-        SpatialListener::new(18.0),
         FollowCamera,
     ));
 }
@@ -674,11 +771,25 @@ fn cleanup_run(
             With<UpgradeMenuText>,
         )>,
     >,
+    navigation_entities: Query<
+        Entity,
+        Or<(
+            With<CompassPickup>,
+            With<TreasureMapPickup>,
+            With<CompassText>,
+            With<TreasureMapText>,
+            With<RatAudioListener>,
+        )>,
+    >,
     maze_entities: Query<Entity, Or<(With<Wall>, With<Floor>, With<Roof>, With<FogCell>)>>,
     mut fog_memory: ResMut<FogMemory>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
-    for entity in run_entities.iter().chain(maze_entities.iter()) {
+    for entity in run_entities
+        .iter()
+        .chain(navigation_entities.iter())
+        .chain(maze_entities.iter())
+    {
         commands.entity(entity).despawn();
     }
     fog_memory.seen = [[false; MAZE_COLUMNS]; MAZE_ROWS];
@@ -923,7 +1034,7 @@ fn spawn_key_door_and_chests(
     game_assets: &GameAssets,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-) -> u32 {
+) -> (u32, (usize, usize)) {
     let start_cell = world_to_cell(start_position).unwrap_or((0, 0));
     let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
     let key_cell = key_cell_on_exit_route(start_cell, exit_cell, maze);
@@ -999,7 +1110,66 @@ fn spawn_key_door_and_chests(
         }
     }
     info!("Spawned {spawned_chests} chests");
-    spawned_chests * 2
+    (spawned_chests * 2, key_cell)
+}
+
+fn spawn_navigation_pickups(
+    commands: &mut Commands,
+    maze: &MazeMap,
+    start_position: Vec3,
+    key_cell: (usize, usize),
+    game_assets: &GameAssets,
+) -> ((usize, usize), (usize, usize)) {
+    let start_cell = world_to_cell(start_position).unwrap_or((0, 0));
+    let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
+    let mut candidates = Vec::new();
+
+    for z in 0..MAZE_ROWS {
+        for x in 0..MAZE_COLUMNS {
+            let cell = (x, z);
+            if cell == start_cell || cell == exit_cell || cell == key_cell {
+                continue;
+            }
+            let spawn_distance = start_cell.0.abs_diff(x) + start_cell.1.abs_diff(z);
+            if spawn_distance <= 3 {
+                continue;
+            }
+
+            let open_edges = maze.cells[z][x].walls.iter().filter(|wall| !**wall).count();
+            if open_edges >= 2 {
+                candidates.push(cell);
+            }
+        }
+    }
+
+    let mut rng = rand::thread_rng();
+    candidates.shuffle(&mut rng);
+    let compass_cell = candidates.first().copied().unwrap_or(key_cell);
+    let treasure_map_cell = candidates
+        .iter()
+        .copied()
+        .find(|cell| *cell != compass_cell)
+        .unwrap_or(start_cell);
+
+    let compass_center = cell_center(compass_cell.0, compass_cell.1);
+    commands.spawn((
+        Sprite::from_image(game_assets.compass.clone()),
+        item_sprite(2.8),
+        Transform::from_xyz(compass_center.x, 2.0, compass_center.y),
+        CompassPickup,
+        Billboard,
+    ));
+
+    let map_center = cell_center(treasure_map_cell.0, treasure_map_cell.1);
+    commands.spawn((
+        Sprite::from_image(game_assets.treasure_map.clone()),
+        item_sprite(2.8),
+        Transform::from_xyz(map_center.x, 2.0, map_center.y),
+        TreasureMapPickup,
+        Billboard,
+    ));
+
+    (compass_cell, treasure_map_cell)
 }
 
 fn item_sprite(pixels_per_metre: f32) -> Sprite3d {
@@ -1072,12 +1242,51 @@ fn collect_ore(
     }
 }
 
+fn collect_navigation_pickups(
+    mut commands: Commands,
+    player_query: Query<&Transform, With<Player>>,
+    compass_query: Query<(Entity, &Transform), With<CompassPickup>>,
+    map_query: Query<(Entity, &Transform), With<TreasureMapPickup>>,
+    game_assets: Res<GameAssets>,
+    mut navigation_state: ResMut<NavigationState>,
+) {
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let player_xz = Vec2::new(
+        player_transform.translation.x,
+        player_transform.translation.z,
+    );
+
+    for (entity, transform) in compass_query.iter() {
+        let pickup_xz = Vec2::new(transform.translation.x, transform.translation.z);
+        if player_xz.distance(pickup_xz) < 30.0 {
+            navigation_state.compass_collected = true;
+            commands.entity(entity).despawn();
+            play_sound(&mut commands, game_assets.pickup_sound.clone());
+            info!("Collected exit compass");
+        }
+    }
+
+    for (entity, transform) in map_query.iter() {
+        let pickup_xz = Vec2::new(transform.translation.x, transform.translation.z);
+        if player_xz.distance(pickup_xz) < 30.0 {
+            navigation_state.treasure_map_collected = true;
+            navigation_state.show_treasure_map = true;
+            commands.entity(entity).despawn();
+            play_sound(&mut commands, game_assets.pickup_sound.clone());
+            info!("Collected treasure map");
+        }
+    }
+}
+
 fn collect_key(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
     key_query: Query<(Entity, &Transform), With<KeyPickup>>,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
+    mut navigation_state: ResMut<NavigationState>,
 ) {
     let Ok(player_transform) = player_query.single() else {
         return;
@@ -1090,6 +1299,7 @@ fn collect_key(
         let key_xz = Vec2::new(transform.translation.x, transform.translation.z);
         if player_xz.distance(key_xz) < 30.0 {
             run_state.keys += 1;
+            navigation_state.key_collected = true;
             commands.entity(entity).despawn();
             play_sound(&mut commands, game_assets.pickup_sound.clone());
             info!("Collected key; keys={}", run_state.keys);
@@ -1103,6 +1313,7 @@ fn unlock_door(
     door_query: Query<(Entity, &WallCollider), With<LockedDoor>>,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
+    mut navigation_state: ResMut<NavigationState>,
 ) {
     if run_state.keys == 0 {
         return;
@@ -1119,6 +1330,7 @@ fn unlock_door(
         if player_xz.distance(collider.center) < 58.0 {
             run_state.keys -= 1;
             run_state.doors_unlocked += 1;
+            navigation_state.door_unlocked = true;
             commands.entity(entity).despawn();
             play_sound(&mut commands, game_assets.unlock_sound.clone());
             info!("Unlocked exit door");
@@ -1158,22 +1370,23 @@ fn open_chest(
 
 fn update_hud(
     run_state: Res<RunState>,
+    navigation_state: Res<NavigationState>,
     mut hud_query: Query<&mut Text, With<HudText>>,
     mut upgrade_menu_query: Query<&mut Text, (With<UpgradeMenuText>, Without<HudText>)>,
 ) {
-    if !run_state.is_changed() {
+    if !run_state.is_changed() && !navigation_state.is_changed() {
         return;
     }
 
     if let Ok(mut text) = hud_query.single_mut() {
-        text.0 = hud_text(&run_state);
+        text.0 = hud_text(&run_state, &navigation_state);
     }
     if let Ok(mut text) = upgrade_menu_query.single_mut() {
         text.0 = upgrade_menu_text(&run_state);
     }
 }
 
-fn hud_text(run_state: &RunState) -> String {
+fn hud_text(run_state: &RunState, navigation_state: &NavigationState) -> String {
     let objective = if run_state.won {
         "Escaped!"
     } else if run_state.caught_by_rat {
@@ -1181,8 +1394,18 @@ fn hud_text(run_state: &RunState) -> String {
     } else {
         "Find the exit"
     };
+    let map_hint = if navigation_state.treasure_map_collected {
+        "  M: map"
+    } else {
+        ""
+    };
+    let compass_hint = if navigation_state.compass_collected {
+        ""
+    } else {
+        "  Find compass"
+    };
     format!(
-        "Treasure: {}/{}  Ore: {}  Keys: {}  Energy: {}/{}\nMining: {}  Speed: {}  Mined: {}  Time: {:.0}s\nScore: {}  Best: {}\nQ/E: turn  T: marker  F: mine  U: upgrades{}\n{}",
+        "Treasure: {}/{}  Ore: {}  Keys: {}  Energy: {}/{}\nMining: {}  Speed: {}  Mined: {}  Time: {:.0}s\nScore: {}  Best: {}\nQ/E: turn  T: marker  F: mine  U: upgrades{}{}{}\n{}",
         run_state.treasure,
         run_state.total_treasure,
         run_state.ore,
@@ -1195,6 +1418,8 @@ fn hud_text(run_state: &RunState) -> String {
         run_state.elapsed_seconds,
         run_state.score,
         run_state.best_score,
+        map_hint,
+        compass_hint,
         if run_state.won || run_state.caught_by_rat {
             "  R: restart"
         } else {
@@ -1202,6 +1427,125 @@ fn hud_text(run_state: &RunState) -> String {
         },
         objective
     )
+}
+
+fn toggle_treasure_map(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut navigation_state: ResMut<NavigationState>,
+    run_state: Res<RunState>,
+) {
+    if run_state.won
+        || run_state.caught_by_rat
+        || !navigation_state.treasure_map_collected
+        || !keyboard.just_pressed(KeyCode::KeyM)
+    {
+        return;
+    }
+
+    navigation_state.show_treasure_map = !navigation_state.show_treasure_map;
+}
+
+fn update_navigation_ui(
+    player_query: Query<&Transform, With<Player>>,
+    orbit: Res<CameraOrbit>,
+    navigation_state: Res<NavigationState>,
+    mut compass_query: Query<(&mut Text, &mut TextColor), With<CompassText>>,
+    mut map_query: Query<
+        (&mut Text, &mut TextColor),
+        (With<TreasureMapText>, Without<CompassText>),
+    >,
+) {
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+
+    let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
+    let exit_center = cell_center(exit_cell.0, exit_cell.1);
+    let exit_direction =
+        relative_direction_label(player_transform.translation, exit_center, orbit.yaw);
+
+    if let Ok((mut text, mut color)) = compass_query.single_mut() {
+        if navigation_state.compass_collected {
+            text.0 = format!("EXIT COMPASS\n   {}", crazy_taxi_arrow(exit_direction));
+            color.0 = if navigation_state.key_collected {
+                Color::srgb(0.25, 1.0, 0.25)
+            } else {
+                Color::srgb(1.0, 0.15, 0.1)
+            };
+        } else {
+            text.0.clear();
+        }
+    }
+
+    let Ok((mut text, mut color)) = map_query.single_mut() else {
+        return;
+    };
+    color.0 = Color::srgb(1.0, 0.84, 0.18);
+    if !navigation_state.treasure_map_collected || !navigation_state.show_treasure_map {
+        text.0.clear();
+        return;
+    }
+
+    text.0 = if !navigation_state.key_collected {
+        if let Some(key_cell) = navigation_state.key_cell {
+            let key_center = cell_center(key_cell.0, key_cell.1);
+            let key_direction =
+                relative_direction_label(player_transform.translation, key_center, orbit.yaw);
+            format!("TREASURE\nKEY {}\nM close", crazy_taxi_arrow(key_direction))
+        } else {
+            "TREASURE\nKEY LOST\nM close".to_string()
+        }
+    } else if !navigation_state.compass_collected {
+        if let Some(compass_cell) = navigation_state.compass_cell {
+            let compass_center = cell_center(compass_cell.0, compass_cell.1);
+            let compass_direction =
+                relative_direction_label(player_transform.translation, compass_center, orbit.yaw);
+            format!(
+                "TREASURE\nCOMPASS {}\nM close",
+                crazy_taxi_arrow(compass_direction)
+            )
+        } else {
+            "TREASURE\nCOMPASS LOST\nM close".to_string()
+        }
+    } else {
+        "TREASURE FOUND\nM close".to_string()
+    };
+}
+
+fn crazy_taxi_arrow(direction: &str) -> &'static str {
+    match direction {
+        "^" => "^^^",
+        "^>" => "^^>",
+        ">" => ">>>",
+        "v>" => "vv>",
+        "v" => "vvv",
+        "v<" => "<vv",
+        "<" => "<<<",
+        "^<" => "<^^",
+        _ => "HERE",
+    }
+}
+
+fn relative_direction_label(from: Vec3, target: Vec2, camera_yaw: f32) -> &'static str {
+    let delta = target - Vec2::new(from.x, from.z);
+    if delta.length_squared() < 4.0 {
+        return "HERE";
+    }
+
+    let direction = delta.normalize();
+    let forward = Vec2::new(-camera_yaw.sin(), -camera_yaw.cos()).normalize();
+    let right = Vec2::new(camera_yaw.cos(), -camera_yaw.sin()).normalize();
+    let angle = direction.dot(right).atan2(direction.dot(forward));
+    match ((angle / std::f32::consts::FRAC_PI_4).round() as i32).rem_euclid(8) {
+        0 => "^",
+        1 => "^>",
+        2 => ">",
+        3 => "v>",
+        4 => "v",
+        5 => "v<",
+        6 => "<",
+        _ => "^<",
+    }
 }
 
 fn upgrade_menu_text(run_state: &RunState) -> String {
@@ -1601,6 +1945,22 @@ fn check_exit_reached(
     }
 }
 
+fn update_audio_listener(
+    player_query: Query<&Transform, (With<Player>, Without<RatAudioListener>)>,
+    mut listener_query: Query<&mut Transform, (With<RatAudioListener>, Without<Player>)>,
+    orbit: Res<CameraOrbit>,
+) {
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let Ok(mut listener_transform) = listener_query.single_mut() else {
+        return;
+    };
+
+    listener_transform.translation = player_transform.translation + Vec3::Y * 28.0;
+    listener_transform.rotation = Quat::from_rotation_y(orbit.yaw);
+}
+
 fn rat_movement(
     mut commands: Commands,
     time: Res<Time>,
@@ -1693,30 +2053,26 @@ fn rat_squeaks(
             continue;
         }
 
-        let route_steps = route_between(player_cell, rat.cell, &maze)
+        let route = route_between(player_cell, rat.cell, &maze);
+        let route_steps = route
+            .as_ref()
             .map(|route| route.len().saturating_sub(1) as f32)
             .unwrap_or(18.0);
-        let direct_steps =
-            player_cell.0.abs_diff(rat.cell.0) as f32 + player_cell.1.abs_diff(rat.cell.1) as f32;
         let distance_t = (route_steps / 12.0).clamp(0.0, 1.0);
         let next_interval = 0.12 + distance_t.powf(1.1) * 3.9 + rng.gen_range(-0.04..=0.28);
         rat.squeak_timer = Timer::from_seconds(next_interval.max(0.1), TimerMode::Once);
 
-        let wall_muffle = if route_steps > direct_steps + 2.0 {
-            0.9
-        } else {
-            1.0
-        };
-        let use_echo = route_steps >= 4.0 || route_steps > direct_steps + 1.5;
+        let clear_line = has_clear_sound_line(player_cell, rat.cell, &maze);
+        let use_echo = !clear_line && route_steps >= 2.0;
         let sound = if use_echo {
             game_assets.rat_squeak_echo_sound.clone()
         } else {
             game_assets.rat_squeak_sound.clone()
         };
         let volume = if use_echo {
-            (0.58 - distance_t * 0.12) * wall_muffle
+            0.62 - distance_t * 0.14
         } else {
-            (1.05 - distance_t * 0.22) * wall_muffle
+            1.05 - distance_t * 0.22
         };
         let speed = if use_echo {
             rng.gen_range(0.82..=0.96)
@@ -1724,6 +2080,11 @@ fn rat_squeaks(
             rng.gen_range(0.96..=1.14)
         };
         let spatial_scale = if use_echo { 0.008 } else { 0.018 };
+        let sound_position = if use_echo {
+            echo_source_position(player_cell, route.as_deref(), rat_transform.translation)
+        } else {
+            rat_transform.translation + Vec3::Y * 18.0
+        };
         commands.spawn((
             AudioPlayer(sound),
             PlaybackSettings::DESPAWN
@@ -1731,9 +2092,74 @@ fn rat_squeaks(
                 .with_speed(speed)
                 .with_spatial(true)
                 .with_spatial_scale(SpatialScale::new(spatial_scale)),
-            *rat_transform,
+            Transform::from_translation(sound_position),
         ));
     }
+}
+
+fn has_clear_sound_line(start: (usize, usize), goal: (usize, usize), maze: &MazeMap) -> bool {
+    if start == goal {
+        return true;
+    }
+
+    if start.0 == goal.0 {
+        let direction = if goal.1 > start.1 {
+            Direction::North
+        } else {
+            Direction::South
+        };
+        return has_clear_axis_path(start, goal, direction, maze);
+    }
+
+    if start.1 == goal.1 {
+        let direction = if goal.0 > start.0 {
+            Direction::East
+        } else {
+            Direction::West
+        };
+        return has_clear_axis_path(start, goal, direction, maze);
+    }
+
+    false
+}
+
+fn has_clear_axis_path(
+    mut current: (usize, usize),
+    goal: (usize, usize),
+    direction: Direction,
+    maze: &MazeMap,
+) -> bool {
+    while current != goal {
+        if maze.cells[current.1][current.0].walls[direction.index()] {
+            return false;
+        }
+        let Some(next) = neighbor_cell(current, direction) else {
+            return false;
+        };
+        if maze.cells[next.1][next.0].walls[direction.opposite().index()] {
+            return false;
+        }
+        current = next;
+    }
+    true
+}
+
+fn echo_source_position(
+    player_cell: (usize, usize),
+    route: Option<&[(usize, usize)]>,
+    fallback: Vec3,
+) -> Vec3 {
+    let Some(route) = route else {
+        return fallback + Vec3::Y * 18.0;
+    };
+    let Some(next_cell) = route.get(1).copied() else {
+        return fallback + Vec3::Y * 18.0;
+    };
+    let Some(direction) = direction_between(player_cell, next_cell) else {
+        return fallback + Vec3::Y * 18.0;
+    };
+    let doorway = edge_center(player_cell, direction);
+    Vec3::new(doorway.x, 22.0, doorway.y)
 }
 
 fn next_step_toward(
