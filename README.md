@@ -6,14 +6,16 @@ Monkey Miner is a small 3D maze game built with Rust and Bevy. You play a miner 
 
 ## Current Game
 
-Each run starts in one corner of a connected maze. The exit is in the far corner, but the path is blocked by a locked door. The key spawns deeper in the maze on the route to the exit, away from both the player spawn and the rat. Treasures, chests, ore-deposit walls, a compass, and a treasure map are scattered through the maze. Mine internal walls to create shortcuts or escape routes, but boundary walls are unbreakable.
+Each run starts along one wall of a connected maze. The exit is in the far corner, but the path is blocked by a locked door. The treasure map spawns after an early fork, out of sight from that fork. After you find it, the map reveals pulsing yellow dig spots with red X marks for the buried key and compass. Mine those glowing cells to launch the pickups out of the ground; they bounce and become collectible after landing. Treasures, chests, and ore-deposit walls are scattered through the maze. Mine internal walls to create shortcuts or escape routes, but boundary walls are unbreakable.
 
 The maze is randomized every time you restart a run. The rooms are intentionally roomy, but fog, the roof, the rat, and limited resources keep the route tense.
 
 ```mermaid
 flowchart LR
-    Start[Start in corner] --> Explore[Explore maze]
-    Explore --> Collect[Collect key, treasure, compass, map]
+    Start[Start on a maze wall] --> Explore[Explore maze]
+    Explore --> Map[Find treasure map]
+    Map --> Dig[Dig up buried key and compass]
+    Dig --> Collect[Collect key, compass, treasure]
     Explore --> Mine[Mine shortcut and ore-deposit walls]
     Mine --> Ore[Pick up ore nuggets]
     Ore --> Upgrade[Upgrade mining or speed]
@@ -29,21 +31,46 @@ flowchart LR
 
 ## Example Maze Layout
 
-The real maze is larger and generated at runtime, but a run starts with this kind of structure. The player begins near one corner, the exit is far away, the key is on the route to the door, and navigation pickups help only after you find them.
+The real maze is generated at runtime, but a run uses this 18x18-cell scale. The player begins on a random wall cell away from the exit corner, the first fork appears after a short entrance corridor, and both first-fork branches lead onward to more forks. This captured debug layout shows the actual wall grid for one generated run, annotated with representative pickup, treasure, ore, rat, buried-target, and hard-wall markers.
 
 ```text
-#############
-#P..T#...O..#
-###..#.###..#
-#?...#...#..#
-#.####.#.#..#
-#T..C#.#.#..#
-#.XX.#.#R#..#
-#..#.#.###..#
-#..#...@.#K.#
-#O.#####.#D##
-#T....C#.#G.#
-#############
+##################################XXX
+#.........#.#P#.......#...#.......DG#
+###.#####.#.#.#.###.###.#.#.#####.XXX
+#.C.#...#.#.#.#...#..T..#...#.....#.#
+#.###.###.#.#.#############.#.#####.#
+#...#...#...#...T...#.....#.#.#...#.#
+###.#.#.#.#########.#.#.###.#.#.#.#.#
+#...#.#...#.....#.....#.#...#.#.#...#
+#.###.#####.###.#.###########.#.#####
+#.#...#..T..#.....#...........#.....#
+#.###O#.#######.###.###########.#####
+#.......#..?..#.#...#...#.......#...#
+#.#######.#.#.#####.#.#.#.#######.#.#
+#.#.....#.#.#.#.....#.#.#.#.....#.#.#
+#.#.###.#.#.#.#.#.###.###.#.#####.#.#
+#.#.#.#.#.#.#.#.#.#.#...T...#.....#.#
+#.#.#.#.###.###.#.#.#.#######.#####.#
+#...#.#...#...#.#.#R......#@......#.#
+#####.###.#.#.#.#.#######.#.#######.#
+#...*...#.#.#...#...#.....#...#.....#
+#.###.###.#.#######.#.#######.#.###.#
+#.#.#..C..#.#.....#.#.......#.#...#.#
+#.#.#######.#####.#.#.###.###.#.###.#
+#...#.....#..C..#.#...#.#.#...#.#.#.#
+###.#.#O#######.#.#####.#.#.###.#.#.#
+#.#.#.#...T...#.#.......#.#.#.#.#...#
+#.#.#.###.#.###.#######.#.#.#.#.#.###
+#.#.#...#.#.#...........#.#K..#.#...#
+#.#.###.#.###.###########.###.#.###.#
+#...#...#..C..#...#.....#.....#.#...#
+#.#############.#.#.###O#.#####.#.###
+#.....*.........#.#.#...#.#.....#...#
+#################.#.#.#####.###O###.#
+#.#.........#.....#.#...#...#.....#.#
+#.#.###.#####.#####.###.#.###.###.#.#
+#..C..#.....T.......#.....#.....#...#
+#####################################
 ```
 
 Legend:
@@ -53,7 +80,7 @@ Legend:
 | `#` | Wall |
 | `.` | Walkable corridor |
 | `P` | Player start |
-| `K` | Key on the route to the exit |
+| `K` | Key after it has been dug up and collected |
 | `D` | Locked door before the exit |
 | `G` | Smiley exit goal |
 | `R` | Rat enemy |
@@ -61,8 +88,9 @@ Legend:
 | `C` | Chest |
 | `O` | Ore-deposit wall |
 | `?` | Treasure map pickup |
-| `@` | Compass pickup that unlocks the exit compass UI |
-| `X` | Hard or unbreakable wall, if present in a generated run |
+| `*` | Buried key/compass dig spot, shown in-game as a pulsing yellow glow with a red X |
+| `@` | Compass after it has been dug up and collected |
+| `X` | Hard goal-area wall requiring 5 mining hits, or an unbreakable boundary wall |
 
 ## Controls
 
@@ -70,16 +98,17 @@ Legend:
 | --- | --- |
 | `W` / `S` | Move forward / backward |
 | `A` / `D` | Strafe left / right |
-| Mouse drag | Orbit camera |
+| Click game window | Capture/hide cursor for mouse-look camera control |
+| Mouse movement | Turn camera while cursor is captured |
+| `Esc` | Release cursor while it is captured |
 | `Q` / `E` | Turn camera left / right |
 | `T` | Drop a trail marker in the current maze cell, if you have one |
 | `F` | Mine the wall you are facing |
-| `U` | Open / close upgrade menu |
+| `R` | Open / close upgrade menu during a run; restart after winning or getting caught |
 | `M` | Open / close treasure map after finding it |
+| `1` / `2` | Select upgrade while the menu is open |
 | `Up` / `Down` | Select upgrade while the menu is open |
-| `Enter` / `Space` | Buy selected upgrade while the menu is open |
-| `Esc` | Close upgrade menu |
-| `R` | Restart after winning or getting caught |
+| `Space` | Buy selected upgrade while the menu is open |
 
 ## Mining And Upgrades
 
@@ -100,12 +129,13 @@ Upgrade rules:
 
 You start with 5 trail markers. Dropping a marker spends 1 marker and marks the current cell. Each loose treasure adds 2 more markers.
 
-The compass and treasure map are world pickups, not free HUD features:
+The treasure map is a world pickup, and the key/compass are buried until the map reveals them:
 
 | Tool | Behavior |
 | --- | --- |
-| Compass | Shows an exit arrow after you find the compass pickup. The arrow is red until you have the key, then green. |
-| Treasure map | Toggle with `M` after pickup. It points to the key first, then to the compass if the key is collected but the compass is still missing. |
+| Treasure map | Toggle with `M` after pickup. It shows separate arrows to the buried key and buried compass. |
+| Buried key/compass | Pulsing yellow glow with a red X in a maze cell. Stand on the glow and press `F` to dig up the pickup. It bounces before becoming collectible. |
+| Compass | After you dig up and collect it, shows an exit arrow. The arrow is red until you have the key, then green. |
 
 ## Scoring
 

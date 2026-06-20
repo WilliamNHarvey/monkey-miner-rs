@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "monkey-miner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bevy",
  "bevy_sprite3d",

@@ -1,6 +1,7 @@
 use bevy::audio::{SpatialScale, Volume};
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
+use bevy::window::{CursorGrabMode, CursorOptions};
 use bevy_sprite3d::prelude::*;
 use rand::Rng;
 use rand::seq::SliceRandom;
@@ -11,10 +12,14 @@ use maze::{
     WallSegment, cell_center, create_maze, world_to_cell,
 };
 
-const MIN_KEY_SPAWN_DISTANCE: usize = 8;
 const MIN_NAV_PICKUP_SPAWN_DISTANCE: usize = 5;
+const MIN_NAV_PICKUP_GOAL_DISTANCE: usize = 5;
+const MIN_MAP_SPAWN_DISTANCE: usize = 6;
+const MAX_MAP_SPAWN_DISTANCE: usize = 12;
 const ORE_WALL_BOUNCE_MARGIN: f32 = 10.0;
 const RAT_SPAWN_CELL: (usize, usize) = (MAZE_COLUMNS / 2, MAZE_ROWS / 2);
+const RAT_SPEED: f32 = 114.0;
+const CHEST_COUNT: u32 = 5;
 const STARTING_TRAIL_MARKERS: u32 = 5;
 const TRAIL_MARKERS_PER_TREASURE: u32 = 2;
 
@@ -59,6 +64,12 @@ struct OreBurst {
 }
 
 #[derive(Component)]
+struct RevealBurst {
+    velocity: Vec3,
+    timer: Timer,
+}
+
+#[derive(Component)]
 struct KeyPickup;
 
 #[derive(Component)]
@@ -66,6 +77,23 @@ struct CompassPickup;
 
 #[derive(Component)]
 struct TreasureMapPickup;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuriedPickupKind {
+    Key,
+    Compass,
+}
+
+#[derive(Component)]
+struct BuriedPickup {
+    cell: (usize, usize),
+    kind: BuriedPickupKind,
+}
+
+#[derive(Component)]
+struct BuriedPickupMarker {
+    cell: (usize, usize),
+}
 
 #[derive(Component)]
 struct LockedDoor;
@@ -86,10 +114,16 @@ struct CompassText;
 struct TreasureMapText;
 
 #[derive(Component)]
+struct TreasureMapCompassText;
+
+#[derive(Component)]
 struct CompassArrow;
 
 #[derive(Component)]
 struct TreasureMapArrow;
+
+#[derive(Component)]
+struct TreasureMapCompassArrow;
 
 #[derive(Component)]
 struct FloatingMessage {
@@ -274,11 +308,13 @@ fn main() {
                 drop_trail_marker,
                 mine_wall,
                 update_ore_bursts,
+                update_reveal_bursts,
                 update_wall_shake,
+                update_buried_glows,
                 update_floating_messages,
                 rat_movement,
                 toggle_treasure_map,
-                camera_drag,
+                camera_mouse_look,
                 update_navigation_ui,
                 update_audio_listener,
                 rat_squeaks,
@@ -611,10 +647,14 @@ fn setup(
     );
     navigation_state.compass_cell = Some(compass_cell);
     info!(
-        "Navigation pickups spawned: compass {:?}, treasure map {:?}",
+        "Navigation targets selected: buried compass {:?}, treasure map pickup {:?}",
         compass_cell, treasure_map_cell
     );
     run_state.total_treasure = loose_treasure + chest_treasure;
+    info!(
+        "Total treasure value this run: {} loose + {} in chests = {}",
+        loose_treasure, chest_treasure, run_state.total_treasure
+    );
 
     commands.spawn((
         Text::new(hud_text(&run_state, &navigation_state)),
@@ -699,6 +739,22 @@ fn setup(
     ));
 
     commands.spawn((
+        Text::new(String::new()),
+        TextFont {
+            font_size: 24.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.25, 0.85, 1.0)),
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(20.0),
+            top: Val::Px(250.0),
+            ..default()
+        },
+        TreasureMapCompassText,
+    ));
+
+    commands.spawn((
         ImageNode {
             image: game_assets.nav_arrow.clone(),
             color: Color::srgba(1.0, 1.0, 1.0, 0.0),
@@ -714,6 +770,24 @@ fn setup(
         },
         UiTransform::IDENTITY,
         TreasureMapArrow,
+    ));
+
+    commands.spawn((
+        ImageNode {
+            image: game_assets.nav_arrow.clone(),
+            color: Color::srgba(1.0, 1.0, 1.0, 0.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(48.0),
+            top: Val::Px(282.0),
+            width: Val::Px(72.0),
+            height: Val::Px(72.0),
+            ..default()
+        },
+        UiTransform::IDENTITY,
+        TreasureMapCompassArrow,
     ));
 
     let monkey_sprite = Sprite3d {
@@ -825,6 +899,7 @@ fn cleanup_run(
             With<TrailMarker>,
             With<Treasure>,
             With<Ore>,
+            With<RevealBurst>,
             With<KeyPickup>,
             With<LockedDoor>,
             With<Chest>,
@@ -837,10 +912,14 @@ fn cleanup_run(
         Or<(
             With<CompassPickup>,
             With<TreasureMapPickup>,
+            With<BuriedPickup>,
+            With<BuriedPickupMarker>,
             With<CompassText>,
             With<TreasureMapText>,
+            With<TreasureMapCompassText>,
             With<CompassArrow>,
             With<TreasureMapArrow>,
+            With<TreasureMapCompassArrow>,
             With<FloatingMessage>,
             With<RatAudioListener>,
         )>,
@@ -953,8 +1032,189 @@ fn spawn_treasures(
         spawned += 1;
     }
 
-    info!("Spawned {spawned} treasures");
+    info!("Spawned {spawned} loose treasure pickups worth {spawned}");
     spawned
+}
+
+fn early_route_map_cell(
+    start_cell: (usize, usize),
+    exit_cell: (usize, usize),
+    key_cell: (usize, usize),
+    compass_cell: (usize, usize),
+    maze: &MazeMap,
+) -> Option<(usize, usize)> {
+    let route = route_between(start_cell, exit_cell, maze)?;
+    best_one_fork_map_cell(route, start_cell, exit_cell, key_cell, compass_cell, maze)
+}
+
+fn any_one_fork_map_cell(
+    start_cell: (usize, usize),
+    exit_cell: (usize, usize),
+    key_cell: (usize, usize),
+    compass_cell: (usize, usize),
+    maze: &MazeMap,
+) -> Option<(usize, usize)> {
+    let cells = (0..MAZE_ROWS).flat_map(|z| (0..MAZE_COLUMNS).map(move |x| (x, z)));
+    best_one_fork_map_cell(cells, start_cell, exit_cell, key_cell, compass_cell, maze)
+}
+
+fn best_one_fork_map_cell<I>(
+    cells: I,
+    start_cell: (usize, usize),
+    exit_cell: (usize, usize),
+    key_cell: (usize, usize),
+    compass_cell: (usize, usize),
+    maze: &MazeMap,
+) -> Option<(usize, usize)>
+where
+    I: IntoIterator<Item = (usize, usize)>,
+{
+    let mut best_preferred = None;
+    let mut best_fallback = None;
+
+    for cell in cells {
+        if cell == start_cell
+            || cell == exit_cell
+            || cell == key_cell
+            || cell == compass_cell
+            || cell == RAT_SPAWN_CELL
+        {
+            continue;
+        }
+        let Some(fork_cell) = one_fork_from_start(start_cell, cell, maze) else {
+            continue;
+        };
+        if cell == fork_cell || visible_from_fork_area(fork_cell, cell, maze) {
+            continue;
+        }
+
+        let distance = manhattan_distance(start_cell, cell);
+        if (MIN_MAP_SPAWN_DISTANCE..=MAX_MAP_SPAWN_DISTANCE).contains(&distance) {
+            if best_preferred
+                .map(|(_, best_distance)| distance < best_distance)
+                .unwrap_or(true)
+            {
+                best_preferred = Some((cell, distance));
+            }
+        } else if best_fallback
+            .map(|(_, best_distance)| distance < best_distance)
+            .unwrap_or(true)
+        {
+            best_fallback = Some((cell, distance));
+        }
+    }
+
+    best_preferred.or(best_fallback).map(|(cell, _)| cell)
+}
+
+#[cfg(test)]
+fn forks_from_start(start: (usize, usize), goal: (usize, usize), maze: &MazeMap) -> Option<usize> {
+    let route = route_between(start, goal, maze)?;
+    Some(
+        route
+            .iter()
+            .filter(|cell| **cell != start && open_neighbors(**cell, maze).len() >= 3)
+            .count(),
+    )
+}
+
+fn one_fork_from_start(
+    start: (usize, usize),
+    goal: (usize, usize),
+    maze: &MazeMap,
+) -> Option<(usize, usize)> {
+    let route = route_between(start, goal, maze)?;
+    let mut forks = route
+        .iter()
+        .copied()
+        .filter(|cell| *cell != start && open_neighbors(*cell, maze).len() >= 3);
+    let fork = forks.next()?;
+    forks.next().is_none().then_some(fork)
+}
+
+fn visible_from_fork_edges(
+    fork_cell: (usize, usize),
+    target: (usize, usize),
+    maze: &MazeMap,
+) -> bool {
+    cardinal_directions().into_iter().any(|(direction, _, _)| {
+        if maze.cells[fork_cell.1][fork_cell.0].walls[direction.index()] {
+            return false;
+        }
+        let Some(mut current) = neighbor_cell(fork_cell, direction) else {
+            return false;
+        };
+        if maze.cells[current.1][current.0].walls[direction.opposite().index()] {
+            return false;
+        }
+
+        loop {
+            if current == target {
+                return true;
+            }
+            if maze.cells[current.1][current.0].walls[direction.index()] {
+                return false;
+            }
+            let Some(next) = neighbor_cell(current, direction) else {
+                return false;
+            };
+            if maze.cells[next.1][next.0].walls[direction.opposite().index()] {
+                return false;
+            }
+            current = next;
+        }
+    })
+}
+
+fn visible_from_fork_area(
+    fork_cell: (usize, usize),
+    target: (usize, usize),
+    maze: &MazeMap,
+) -> bool {
+    if visible_from_fork_edges(fork_cell, target, maze) {
+        return true;
+    }
+
+    let visible = visibility_cells_from(fork_cell, maze, 3);
+    for z in 0..MAZE_ROWS {
+        for x in 0..MAZE_COLUMNS {
+            if !visible[z][x] {
+                continue;
+            }
+            if x.abs_diff(target.0) <= 1 && z.abs_diff(target.1) <= 1 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn visibility_cells_from(
+    origin: (usize, usize),
+    maze: &MazeMap,
+    max_distance: usize,
+) -> [[bool; MAZE_COLUMNS]; MAZE_ROWS] {
+    let mut visible = [[false; MAZE_COLUMNS]; MAZE_ROWS];
+    let mut queue = VecDeque::new();
+
+    visible[origin.1][origin.0] = true;
+    queue.push_back((origin, 0usize));
+
+    while let Some((cell, distance)) = queue.pop_front() {
+        if distance >= max_distance {
+            continue;
+        }
+        for next in open_neighbors(cell, maze) {
+            if visible[next.1][next.0] {
+                continue;
+            }
+            visible[next.1][next.0] = true;
+            queue.push_back((next, distance + 1));
+        }
+    }
+
+    visible
 }
 
 fn open_neighbors(cell: (usize, usize), maze: &MazeMap) -> Vec<(usize, usize)> {
@@ -1071,53 +1331,43 @@ fn route_between(
     None
 }
 
-fn key_cell_on_exit_route(
+fn manhattan_distance(a: (usize, usize), b: (usize, usize)) -> usize {
+    a.0.abs_diff(b.0) + a.1.abs_diff(b.1)
+}
+
+fn buried_target_cell(
     start_cell: (usize, usize),
     exit_cell: (usize, usize),
     maze: &MazeMap,
-) -> (usize, usize) {
-    if let Some(route) = route_between(start_cell, exit_cell, maze) {
-        let furthest_index = route.len().saturating_sub(2);
-        if furthest_index > 0 {
-            let min_index = furthest_index.min(MIN_KEY_SPAWN_DISTANCE);
-            let preferred_index = ((route.len() * 3) / 5).clamp(min_index, furthest_index);
-            if let Some(cell) = route[preferred_index..=furthest_index]
-                .iter()
-                .copied()
-                .find(|cell| {
-                    *cell != RAT_SPAWN_CELL
-                        && manhattan_distance(start_cell, *cell) >= MIN_KEY_SPAWN_DISTANCE
-                })
+    blocked: &[(usize, usize)],
+) -> Option<(usize, usize)> {
+    let mut candidates = Vec::new();
+    for z in 0..MAZE_ROWS {
+        for x in 0..MAZE_COLUMNS {
+            let cell = (x, z);
+            if cell == start_cell
+                || cell == exit_cell
+                || cell == RAT_SPAWN_CELL
+                || blocked.contains(&cell)
             {
-                return cell;
+                continue;
             }
-            if let Some(cell) = route[min_index..=furthest_index]
-                .iter()
-                .copied()
-                .rev()
-                .find(|cell| {
-                    *cell != RAT_SPAWN_CELL
-                        && manhattan_distance(start_cell, *cell) >= MIN_KEY_SPAWN_DISTANCE
-                })
-            {
-                return cell;
+            if route_between(start_cell, cell, maze).is_some() {
+                candidates.push(cell);
             }
-            return route[furthest_index];
         }
     }
 
-    far_spawn_candidate(start_cell, exit_cell, maze, MIN_KEY_SPAWN_DISTANCE).unwrap_or(start_cell)
-}
-
-fn manhattan_distance(a: (usize, usize), b: (usize, usize)) -> usize {
-    a.0.abs_diff(b.0) + a.1.abs_diff(b.1)
+    candidates.shuffle(&mut rand::thread_rng());
+    candidates.first().copied()
 }
 
 fn far_spawn_candidate(
     start_cell: (usize, usize),
     exit_cell: (usize, usize),
     maze: &MazeMap,
-    min_distance: usize,
+    min_start_distance: usize,
+    min_goal_distance: usize,
 ) -> Option<(usize, usize)> {
     let mut best = None;
     let mut best_distance = 0;
@@ -1127,8 +1377,13 @@ fn far_spawn_candidate(
             if cell == start_cell || cell == exit_cell || cell == RAT_SPAWN_CELL {
                 continue;
             }
-            let distance = manhattan_distance(start_cell, cell);
-            if distance < min_distance || distance <= best_distance {
+            let start_distance = manhattan_distance(start_cell, cell);
+            let goal_distance = manhattan_distance(exit_cell, cell);
+            if start_distance < min_start_distance || goal_distance < min_goal_distance {
+                continue;
+            }
+            let distance = start_distance.min(goal_distance);
+            if distance <= best_distance {
                 continue;
             }
             if route_between(start_cell, cell, maze).is_some() {
@@ -1150,16 +1405,8 @@ fn spawn_key_door_and_chests(
 ) -> (u32, (usize, usize)) {
     let start_cell = world_to_cell(start_position).unwrap_or((0, 0));
     let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
-    let key_cell = key_cell_on_exit_route(start_cell, exit_cell, maze);
-    let key_center = cell_center(key_cell.0, key_cell.1);
-    commands.spawn((
-        Sprite::from_image(game_assets.key.clone()),
-        item_sprite(2.6),
-        Transform::from_xyz(key_center.x, 2.0, key_center.y),
-        KeyPickup,
-        Billboard,
-    ));
-    info!("Key spawned at cell {:?}", key_cell);
+    let key_cell = buried_target_cell(start_cell, exit_cell, maze, &[]).unwrap_or(start_cell);
+    info!("Buried key target selected at cell {:?}", key_cell);
 
     if let Some(door_neighbor) = open_neighbors(exit_cell, maze).first().copied() {
         if let Some(door_direction) = direction_between(door_neighbor, exit_cell) {
@@ -1213,7 +1460,7 @@ fn spawn_key_door_and_chests(
     let mut spawned_chests = 0;
     for z in 0..MAZE_ROWS {
         for x in 0..MAZE_COLUMNS {
-            if spawned_chests >= 3
+            if spawned_chests >= CHEST_COUNT
                 || (x, z) == start_cell
                 || (x, z) == exit_cell
                 || (x, z) == key_cell
@@ -1229,7 +1476,7 @@ fn spawn_key_door_and_chests(
             let center = cell_center(x, z);
             commands.spawn((
                 Sprite::from_image(game_assets.chest.clone()),
-                item_sprite(2.6),
+                item_sprite(4.0),
                 Transform::from_xyz(center.x, 2.0, center.y),
                 Chest,
                 Billboard,
@@ -1251,6 +1498,7 @@ fn spawn_navigation_pickups(
     let start_cell = world_to_cell(start_position).unwrap_or((0, 0));
     let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
     let mut candidates = Vec::new();
+    let mut map_candidates = Vec::new();
 
     for z in 0..MAZE_ROWS {
         for x in 0..MAZE_COLUMNS {
@@ -1260,36 +1508,52 @@ fn spawn_navigation_pickups(
                 continue;
             }
             let spawn_distance = manhattan_distance(start_cell, cell);
-            if spawn_distance < MIN_NAV_PICKUP_SPAWN_DISTANCE {
+            let goal_distance = manhattan_distance(exit_cell, cell);
+            if spawn_distance < MIN_NAV_PICKUP_SPAWN_DISTANCE
+                || goal_distance < MIN_NAV_PICKUP_GOAL_DISTANCE
+            {
                 continue;
             }
 
             let open_edges = maze.cells[z][x].walls.iter().filter(|wall| !**wall).count();
             if open_edges >= 2 {
                 candidates.push(cell);
+                if (MIN_MAP_SPAWN_DISTANCE..=MAX_MAP_SPAWN_DISTANCE).contains(&spawn_distance) {
+                    map_candidates.push(cell);
+                }
             }
         }
     }
 
     let mut rng = rand::thread_rng();
     candidates.shuffle(&mut rng);
-    let fallback = far_spawn_candidate(start_cell, exit_cell, maze, MIN_NAV_PICKUP_SPAWN_DISTANCE)
-        .unwrap_or(key_cell);
-    let compass_cell = candidates.first().copied().unwrap_or(fallback);
-    let treasure_map_cell = candidates
-        .iter()
-        .copied()
-        .find(|cell| *cell != compass_cell)
-        .unwrap_or(fallback);
-
-    let compass_center = cell_center(compass_cell.0, compass_cell.1);
-    commands.spawn((
-        Sprite::from_image(game_assets.compass.clone()),
-        item_sprite(5.6),
-        Transform::from_xyz(compass_center.x, 2.0, compass_center.y),
-        CompassPickup,
-        Billboard,
-    ));
+    map_candidates.shuffle(&mut rng);
+    let map_fallback = far_spawn_candidate(
+        start_cell,
+        exit_cell,
+        maze,
+        MIN_NAV_PICKUP_SPAWN_DISTANCE,
+        MIN_NAV_PICKUP_GOAL_DISTANCE,
+    )
+    .unwrap_or(key_cell);
+    let compass_cell =
+        buried_target_cell(start_cell, exit_cell, maze, &[key_cell]).unwrap_or(key_cell);
+    let treasure_map_cell =
+        early_route_map_cell(start_cell, exit_cell, key_cell, compass_cell, maze)
+            .or_else(|| any_one_fork_map_cell(start_cell, exit_cell, key_cell, compass_cell, maze))
+            .or_else(|| {
+                map_candidates
+                    .iter()
+                    .copied()
+                    .find(|cell| *cell != compass_cell)
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|cell| *cell != compass_cell)
+            })
+            .unwrap_or(map_fallback);
 
     let map_center = cell_center(treasure_map_cell.0, treasure_map_cell.1);
     commands.spawn((
@@ -1377,9 +1641,11 @@ fn collect_ore(
 fn collect_navigation_pickups(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
-    compass_query: Query<(Entity, &Transform), With<CompassPickup>>,
+    compass_query: Query<(Entity, &Transform), (With<CompassPickup>, Without<RevealBurst>)>,
     map_query: Query<(Entity, &Transform), With<TreasureMapPickup>>,
     game_assets: Res<GameAssets>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut navigation_state: ResMut<NavigationState>,
 ) {
     let Ok(player_transform) = player_query.single() else {
@@ -1406,8 +1672,81 @@ fn collect_navigation_pickups(
             navigation_state.treasure_map_collected = true;
             navigation_state.show_treasure_map = true;
             commands.entity(entity).despawn();
+            spawn_buried_navigation_targets(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                navigation_state.key_cell,
+                navigation_state.compass_cell,
+            );
             play_sound(&mut commands, game_assets.pickup_sound.clone());
             info!("Collected treasure map");
+        }
+    }
+}
+
+fn spawn_buried_navigation_targets(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    key_cell: Option<(usize, usize)>,
+    compass_cell: Option<(usize, usize)>,
+) {
+    if let Some(cell) = key_cell {
+        spawn_buried_pickup(commands, meshes, materials, cell, BuriedPickupKind::Key);
+    }
+    if let Some(cell) = compass_cell {
+        spawn_buried_pickup(commands, meshes, materials, cell, BuriedPickupKind::Compass);
+    }
+}
+
+fn spawn_buried_pickup(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    cell: (usize, usize),
+    kind: BuriedPickupKind,
+) {
+    let center = cell_center(cell.0, cell.1);
+    let material = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.86, 0.16, 0.72),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(42.0, 1.0, 42.0))),
+        MeshMaterial3d(material),
+        Transform::from_xyz(center.x, 0.6, center.y),
+        BuriedPickup { cell, kind },
+    ));
+    let red_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.0, 0.0),
+        unlit: true,
+        ..default()
+    });
+    let x_bar_mesh = meshes.add(Cuboid::new(58.0, 1.5, 10.0));
+    for rotation in [std::f32::consts::FRAC_PI_4, -std::f32::consts::FRAC_PI_4] {
+        commands.spawn((
+            Mesh3d(x_bar_mesh.clone()),
+            MeshMaterial3d(red_material.clone()),
+            Transform::from_xyz(center.x, 1.4, center.y)
+                .with_rotation(Quat::from_rotation_y(rotation)),
+            BuriedPickupMarker { cell },
+        ));
+    }
+}
+
+fn update_buried_glows(
+    time: Res<Time>,
+    query: Query<&MeshMaterial3d<StandardMaterial>, With<BuriedPickup>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let pulse = (time.elapsed_secs() * 4.0).sin() * 0.5 + 0.5;
+    let alpha = 0.36 + pulse * 0.42;
+    for material_handle in query.iter() {
+        if let Some(material) = materials.get_mut(&material_handle.0) {
+            material.base_color = Color::srgba(1.0, 0.86, 0.16, alpha);
         }
     }
 }
@@ -1415,7 +1754,7 @@ fn collect_navigation_pickups(
 fn collect_key(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
-    key_query: Query<(Entity, &Transform), With<KeyPickup>>,
+    key_query: Query<(Entity, &Transform), (With<KeyPickup>, Without<RevealBurst>)>,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
     mut navigation_state: ResMut<NavigationState>,
@@ -1530,6 +1869,12 @@ fn hud_text(run_state: &RunState, navigation_state: &NavigationState) -> String 
         "Escaped!"
     } else if run_state.caught_by_rat {
         "Caught by the rat!"
+    } else if !navigation_state.treasure_map_collected {
+        "Find treasure map"
+    } else if !navigation_state.key_collected || !navigation_state.compass_collected {
+        "Dig up key and compass"
+    } else if !navigation_state.door_unlocked {
+        "Unlock exit door"
     } else {
         "Find the exit"
     };
@@ -1538,13 +1883,9 @@ fn hud_text(run_state: &RunState, navigation_state: &NavigationState) -> String 
     } else {
         ""
     };
-    let compass_hint = if navigation_state.compass_collected {
-        ""
-    } else {
-        "  Find compass"
-    };
+    let compass_hint = "";
     format!(
-        "Treasure: {}/{}  Ore: {}  Markers: {}  Keys: {}  Energy: {}/{}\nMining: {}  Speed: {}  Mined: {}  Time: {:.0}s\nScore: {}  Best: {}\nQ/E: turn  T: marker  F: mine  U: upgrades{}{}{}\n{}",
+        "Treasure: {}/{}  Ore: {}  Markers: {}  Keys: {}  Energy: {}/{}\nMining: {}  Speed: {}  Mined: {}  Time: {:.0}s\nScore: {}  Best: {}\nQ/E: turn  T: marker  F: mine  R: upgrades{}{}{}\n{}",
         run_state.treasure,
         run_state.total_treasure,
         run_state.ore,
@@ -1592,7 +1933,19 @@ fn update_navigation_ui(
     mut compass_query: Query<(&mut Text, &mut TextColor), With<CompassText>>,
     mut map_query: Query<
         (&mut Text, &mut TextColor),
-        (With<TreasureMapText>, Without<CompassText>),
+        (
+            With<TreasureMapText>,
+            Without<CompassText>,
+            Without<TreasureMapCompassText>,
+        ),
+    >,
+    mut map_compass_text_query: Query<
+        &mut Text,
+        (
+            With<TreasureMapCompassText>,
+            Without<CompassText>,
+            Without<TreasureMapText>,
+        ),
     >,
     mut compass_arrow_query: Query<
         (&mut ImageNode, &mut UiTransform),
@@ -1600,7 +1953,19 @@ fn update_navigation_ui(
     >,
     mut map_arrow_query: Query<
         (&mut ImageNode, &mut UiTransform),
-        (With<TreasureMapArrow>, Without<CompassArrow>),
+        (
+            With<TreasureMapArrow>,
+            Without<CompassArrow>,
+            Without<TreasureMapCompassArrow>,
+        ),
+    >,
+    mut map_compass_arrow_query: Query<
+        (&mut ImageNode, &mut UiTransform),
+        (
+            With<TreasureMapCompassArrow>,
+            Without<CompassArrow>,
+            Without<TreasureMapArrow>,
+        ),
     >,
 ) {
     let Ok(player_transform) = player_query.single() else {
@@ -1633,53 +1998,69 @@ fn update_navigation_ui(
     let Ok((mut text, mut color)) = map_query.single_mut() else {
         return;
     };
+    let Ok(mut compass_text) = map_compass_text_query.single_mut() else {
+        return;
+    };
     color.0 = Color::srgb(1.0, 0.84, 0.18);
     if !navigation_state.treasure_map_collected || !navigation_state.show_treasure_map {
         text.0.clear();
+        compass_text.0.clear();
         if let Ok((mut arrow, _)) = map_arrow_query.single_mut() {
+            arrow.color = Color::srgba(1.0, 1.0, 1.0, 0.0);
+        }
+        if let Ok((mut arrow, _)) = map_compass_arrow_query.single_mut() {
             arrow.color = Color::srgba(1.0, 1.0, 1.0, 0.0);
         }
         return;
     }
 
-    let map_arrow_angle = if !navigation_state.key_collected {
-        if let Some(key_cell) = navigation_state.key_cell {
+    let key_angle = (!navigation_state.key_collected)
+        .then_some(navigation_state.key_cell)
+        .flatten()
+        .map(|key_cell| {
             let key_center = cell_center(key_cell.0, key_cell.1);
-            text.0 = "TREASURE MAP\nKEY".to_string();
-            Some(relative_direction_angle(
-                player_transform.translation,
-                key_center,
-                orbit.yaw,
-            ))
-        } else {
-            text.0 = "TREASURE MAP\nKEY LOST".to_string();
-            None
-        }
-    } else if !navigation_state.compass_collected {
-        if let Some(compass_cell) = navigation_state.compass_cell {
+            relative_direction_angle(player_transform.translation, key_center, orbit.yaw)
+        });
+    let compass_angle = (!navigation_state.compass_collected)
+        .then_some(navigation_state.compass_cell)
+        .flatten()
+        .map(|compass_cell| {
             let compass_center = cell_center(compass_cell.0, compass_cell.1);
-            text.0 = "TREASURE MAP\nCOMPASS".to_string();
-            Some(relative_direction_angle(
-                player_transform.translation,
-                compass_center,
-                orbit.yaw,
-            ))
-        } else {
-            text.0 = "TREASURE MAP\nCOMPASS LOST".to_string();
-            None
-        }
+            relative_direction_angle(player_transform.translation, compass_center, orbit.yaw)
+        });
+
+    text.0 = if key_angle.is_some() {
+        "TREASURE MAP\nKEY".to_string()
+    } else if compass_angle.is_none() {
+        "TREASURE FOUND".to_string()
     } else {
-        text.0 = "TREASURE FOUND".to_string();
-        None
+        "TREASURE MAP".to_string()
+    };
+    compass_text.0 = if compass_angle.is_some() {
+        "COMPASS".to_string()
+    } else {
+        String::new()
     };
 
     if let Ok((mut arrow, mut transform)) = map_arrow_query.single_mut() {
-        if let Some(angle) = map_arrow_angle {
+        if let Some(angle) = key_angle {
             set_ui_arrow(
                 &mut arrow,
                 &mut transform,
                 angle,
                 Color::srgb(1.0, 0.84, 0.18),
+            )
+        } else {
+            arrow.color = Color::srgba(1.0, 1.0, 1.0, 0.0);
+        }
+    }
+    if let Ok((mut arrow, mut transform)) = map_compass_arrow_query.single_mut() {
+        if let Some(angle) = compass_angle {
+            set_ui_arrow(
+                &mut arrow,
+                &mut transform,
+                angle,
+                Color::srgb(0.25, 0.85, 1.0),
             )
         } else {
             arrow.color = Color::srgba(1.0, 1.0, 1.0, 0.0);
@@ -1693,7 +2074,7 @@ fn set_ui_arrow(arrow: &mut ImageNode, transform: &mut UiTransform, angle: f32, 
 }
 
 fn ui_arrow_rotation(direction_angle: f32) -> f32 {
-    direction_angle - std::f32::consts::FRAC_PI_2
+    -direction_angle
 }
 
 fn relative_direction_angle(from: Vec3, target: Vec2, camera_yaw: f32) -> f32 {
@@ -1736,7 +2117,7 @@ fn upgrade_menu_text(run_state: &RunState) -> String {
         " "
     };
     format!(
-        "UPGRADES\nOre: {}\n\n{} Mining energy\n  Cost: {} ore\n  Level: {} -> {}\n\n{} Movement speed\n  Cost: {} ore\n  Level: {} -> {}\n\nUp/Down select\nEnter buy\nU/Esc close",
+        "UPGRADES\nOre: {}\n\n{} 1 Mining energy\n  Cost: {} ore\n  Level: {} -> {}\n\n{} 2 Movement speed\n  Cost: {} ore\n  Level: {} -> {}\n\n1/2 or Up/Down select\nSpace buy\nR close",
         run_state.ore,
         mining_prefix,
         upgrade_cost(run_state.pickaxe_level),
@@ -1763,22 +2144,26 @@ fn upgrade_pickaxe(
         return;
     }
 
-    if keyboard.just_pressed(KeyCode::KeyU) {
+    if keyboard.just_pressed(KeyCode::KeyR) {
         run_state.upgrade_menu_open = !run_state.upgrade_menu_open;
         return;
     }
     if !run_state.upgrade_menu_open {
         return;
     }
-    if keyboard.just_pressed(KeyCode::Escape) {
-        run_state.upgrade_menu_open = false;
+    if keyboard.just_pressed(KeyCode::Digit1) || keyboard.just_pressed(KeyCode::Numpad1) {
+        run_state.upgrade_selection = 0;
+        return;
+    }
+    if keyboard.just_pressed(KeyCode::Digit2) || keyboard.just_pressed(KeyCode::Numpad2) {
+        run_state.upgrade_selection = 1;
         return;
     }
     if keyboard.just_pressed(KeyCode::ArrowUp) || keyboard.just_pressed(KeyCode::ArrowDown) {
         run_state.upgrade_selection = 1 - run_state.upgrade_selection;
         return;
     }
-    if !keyboard.just_pressed(KeyCode::Enter) && !keyboard.just_pressed(KeyCode::Space) {
+    if !keyboard.just_pressed(KeyCode::Space) {
         return;
     }
 
@@ -1824,6 +2209,8 @@ fn mine_wall(
         &mut MeshMaterial3d<StandardMaterial>,
         &Transform,
     )>,
+    buried_query: Query<(Entity, &BuriedPickup)>,
+    buried_marker_query: Query<(Entity, &BuriedPickupMarker)>,
     hard_wall_assets: Res<HardWallAssets>,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
@@ -1840,6 +2227,22 @@ fn mine_wall(
     let Some(cell) = world_to_cell(player_transform.translation) else {
         return;
     };
+    if let Some((entity, buried)) = buried_query
+        .iter()
+        .find(|(_, buried)| buried.cell == cell)
+        .map(|(entity, buried)| (entity, buried.kind))
+    {
+        commands.entity(entity).despawn();
+        for (marker_entity, marker) in buried_marker_query.iter() {
+            if marker.cell == cell {
+                commands.entity(marker_entity).despawn();
+            }
+        }
+        spawn_revealed_navigation_pickup(&mut commands, &game_assets, cell, buried);
+        play_sound(&mut commands, game_assets.mine_sound.clone());
+        info!("Unearthed navigation pickup at cell {:?}", cell);
+        return;
+    }
     let direction = facing_direction(orbit.yaw);
     if !maze.cells[cell.1][cell.0].walls[direction.index()] {
         info!(
@@ -1921,6 +2324,49 @@ fn mine_wall(
         cell,
         direction.index()
     );
+}
+
+fn spawn_revealed_navigation_pickup(
+    commands: &mut Commands,
+    game_assets: &GameAssets,
+    cell: (usize, usize),
+    kind: BuriedPickupKind,
+) {
+    let center = cell_center(cell.0, cell.1);
+    let mut rng = rand::thread_rng();
+    let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+    let speed = rng.gen_range(60.0..=110.0);
+    let velocity = Vec3::new(
+        angle.cos() * speed,
+        rng.gen_range(100.0..=150.0),
+        angle.sin() * speed,
+    );
+    let reveal_burst = RevealBurst {
+        velocity,
+        timer: Timer::from_seconds(0.9, TimerMode::Once),
+    };
+    match kind {
+        BuriedPickupKind::Key => {
+            commands.spawn((
+                Sprite::from_image(game_assets.key.clone()),
+                item_sprite(2.6),
+                Transform::from_xyz(center.x, 18.0, center.y),
+                KeyPickup,
+                reveal_burst,
+                Billboard,
+            ));
+        }
+        BuriedPickupKind::Compass => {
+            commands.spawn((
+                Sprite::from_image(game_assets.compass.clone()),
+                item_sprite(5.6),
+                Transform::from_xyz(center.x, 18.0, center.y),
+                CompassPickup,
+                reveal_burst,
+                Billboard,
+            ));
+        }
+    }
 }
 
 fn spawn_floating_message(commands: &mut Commands, message: &'static str) {
@@ -2008,8 +2454,8 @@ fn update_ore_bursts(
         burst.velocity.y -= 360.0 * dt;
         let x_delta = burst.velocity.x * dt;
         let z_delta = burst.velocity.z * dt;
-        move_ore_burst_axis(&mut transform, &mut burst, &maze, x_delta, true);
-        move_ore_burst_axis(&mut transform, &mut burst, &maze, z_delta, false);
+        move_burst_axis(&mut transform, &mut burst.velocity, &maze, x_delta, true);
+        move_burst_axis(&mut transform, &mut burst.velocity, &maze, z_delta, false);
         transform.translation.y += burst.velocity.y * dt;
 
         if transform.translation.y <= 2.0 {
@@ -2030,9 +2476,43 @@ fn update_ore_bursts(
     }
 }
 
-fn move_ore_burst_axis(
+fn update_reveal_bursts(
+    time: Res<Time>,
+    maze: Res<MazeMap>,
+    mut query: Query<(Entity, &mut Transform, &mut RevealBurst)>,
+    mut commands: Commands,
+) {
+    let dt = time.delta_secs();
+    for (entity, mut transform, mut burst) in query.iter_mut() {
+        burst.timer.tick(time.delta());
+        burst.velocity.y -= 360.0 * dt;
+        let x_delta = burst.velocity.x * dt;
+        let z_delta = burst.velocity.z * dt;
+        move_burst_axis(&mut transform, &mut burst.velocity, &maze, x_delta, true);
+        move_burst_axis(&mut transform, &mut burst.velocity, &maze, z_delta, false);
+        transform.translation.y += burst.velocity.y * dt;
+
+        if transform.translation.y <= 2.0 {
+            transform.translation.y = 2.0;
+            if burst.velocity.y < -18.0 && !burst.timer.is_finished() {
+                burst.velocity.y = -burst.velocity.y * 0.34;
+                burst.velocity.x *= 0.72;
+                burst.velocity.z *= 0.72;
+            } else {
+                commands.entity(entity).remove::<RevealBurst>();
+            }
+        }
+
+        if burst.timer.is_finished() {
+            transform.translation.y = 2.0;
+            commands.entity(entity).remove::<RevealBurst>();
+        }
+    }
+}
+
+fn move_burst_axis(
     transform: &mut Transform,
-    burst: &mut OreBurst,
+    velocity: &mut Vec3,
     maze: &MazeMap,
     delta: f32,
     x_axis: bool,
@@ -2052,30 +2532,30 @@ fn move_ore_burst_axis(
     if ore_move_blocked(old_position, candidate, maze) {
         let Some(cell) = world_to_cell(old_position) else {
             if x_axis {
-                burst.velocity.x *= -0.55;
+                velocity.x *= -0.55;
             } else {
-                burst.velocity.z *= -0.55;
+                velocity.z *= -0.55;
             }
             return;
         };
         let center = cell_center(cell.0, cell.1);
         let half_cell = maze::CELL_SIZE * 0.5 - ORE_WALL_BOUNCE_MARGIN;
         if x_axis {
-            burst.velocity.x *= -0.55;
+            velocity.x *= -0.55;
             transform.translation.x = if delta > 0.0 {
                 center.x + half_cell
             } else {
                 center.x - half_cell
             };
         } else {
-            burst.velocity.z *= -0.55;
+            velocity.z *= -0.55;
             transform.translation.z = if delta > 0.0 {
                 center.y + half_cell
             } else {
                 center.y - half_cell
             };
         }
-        burst.velocity.y *= 0.9;
+        velocity.y *= 0.9;
     } else if x_axis {
         transform.translation.x = candidate.x;
     } else {
@@ -2331,7 +2811,7 @@ fn rat_movement(
             continue;
         }
 
-        let step = 92.0 * time.delta_secs();
+        let step = RAT_SPEED * time.delta_secs();
         let movement = to_target.normalize() * step.min(distance);
         transform.translation += movement;
         transform.rotation = Quat::from_rotation_y(movement.x.atan2(movement.z));
@@ -2573,13 +3053,23 @@ fn direction_between(from: (usize, usize), to: (usize, usize)) -> Option<Directi
     }
 }
 
-fn camera_drag(
+fn camera_mouse_look(
     keyboard: Res<ButtonInput<KeyCode>>,
-    mouse_button: Res<ButtonInput<MouseButton>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut cursor_options: Single<&mut CursorOptions>,
     mut mouse_motion: MessageReader<MouseMotion>,
     time: Res<Time>,
     mut orbit: ResMut<CameraOrbit>,
 ) {
+    if mouse.just_pressed(MouseButton::Left) || mouse.just_pressed(MouseButton::Right) {
+        cursor_options.visible = false;
+        cursor_options.grab_mode = CursorGrabMode::Locked;
+    }
+    if keyboard.just_pressed(KeyCode::Escape) {
+        cursor_options.visible = true;
+        cursor_options.grab_mode = CursorGrabMode::None;
+    }
+
     let keyboard_rotation = 3.8 * time.delta_secs();
     if keyboard.pressed(KeyCode::KeyQ) {
         orbit.yaw = (orbit.yaw + keyboard_rotation).rem_euclid(std::f32::consts::TAU);
@@ -2593,9 +3083,7 @@ fn camera_drag(
         total_motion += event.delta;
     }
 
-    let dragging =
-        mouse_button.pressed(MouseButton::Left) || mouse_button.pressed(MouseButton::Right);
-    if !dragging || total_motion.length_squared() < 0.1 {
+    if cursor_options.grab_mode != CursorGrabMode::Locked || total_motion.length_squared() < 0.1 {
         return;
     }
 
@@ -2914,6 +3402,18 @@ mod tests {
         }
     }
 
+    fn connect_cells(maze: &mut MazeMap, a: (usize, usize), b: (usize, usize)) {
+        let direction = match (b.0 as isize - a.0 as isize, b.1 as isize - a.1 as isize) {
+            (0, 1) => Direction::North,
+            (1, 0) => Direction::East,
+            (0, -1) => Direction::South,
+            (-1, 0) => Direction::West,
+            _ => panic!("test cells must be cardinal neighbors"),
+        };
+        maze.cells[a.1][a.0].walls[direction.index()] = false;
+        maze.cells[b.1][b.0].walls[direction.opposite().index()] = false;
+    }
+
     fn assert_close(actual: f32, expected: f32) {
         assert!(
             (actual - expected).abs() < 0.001,
@@ -2944,12 +3444,33 @@ mod tests {
 
     #[test]
     fn ui_arrow_rotation_accounts_for_right_facing_texture() {
-        assert_close(ui_arrow_rotation(0.0), -std::f32::consts::FRAC_PI_2);
-        assert_close(ui_arrow_rotation(std::f32::consts::FRAC_PI_2), 0.0);
+        assert_close(ui_arrow_rotation(0.0), 0.0);
+        assert_close(
+            ui_arrow_rotation(std::f32::consts::FRAC_PI_2),
+            -std::f32::consts::FRAC_PI_2,
+        );
         assert_close(
             ui_arrow_rotation(-std::f32::consts::FRAC_PI_2),
-            -std::f32::consts::PI,
+            std::f32::consts::FRAC_PI_2,
         );
+    }
+
+    #[test]
+    fn ui_arrow_counter_rotates_when_camera_turns_clockwise() {
+        let target_east = Vec2::new(1.0, 0.0);
+        let facing_north = std::f32::consts::PI;
+        let clockwise_turn = facing_north + 0.1;
+
+        let before = ui_arrow_rotation(direction_angle_relative_to_camera(
+            target_east,
+            facing_north,
+        ));
+        let after = ui_arrow_rotation(direction_angle_relative_to_camera(
+            target_east,
+            clockwise_turn,
+        ));
+
+        assert!(after > before, "expected arrow to counter-rotate on screen");
     }
 
     #[test]
@@ -2973,6 +3494,32 @@ mod tests {
 
         assert!(direction_angle_relative_to_camera(source_east, std::f32::consts::PI) > 0.0);
         assert!(direction_angle_relative_to_camera(source_east, 0.0) < 0.0);
+    }
+
+    #[test]
+    fn treasure_map_spawns_one_fork_away_after_a_turn() {
+        let mut maze = test_maze();
+        for pair in [
+            ((0, 0), (0, 1)),
+            ((0, 1), (0, 2)),
+            ((0, 2), (0, 3)),
+            ((0, 2), (1, 2)),
+            ((1, 2), (2, 2)),
+            ((2, 2), (2, 3)),
+            ((2, 3), (2, 4)),
+            ((2, 4), (2, 5)),
+            ((2, 5), (2, 6)),
+            ((2, 6), (2, 7)),
+        ] {
+            connect_cells(&mut maze, pair.0, pair.1);
+        }
+
+        let map_cell = early_route_map_cell((0, 0), (2, 7), (5, 5), (6, 6), &maze).unwrap();
+
+        assert_eq!(map_cell, (2, 5));
+        assert_eq!(forks_from_start((0, 0), map_cell, &maze), Some(1));
+        assert!(manhattan_distance((0, 0), map_cell) >= MIN_MAP_SPAWN_DISTANCE);
+        assert!(!visible_from_fork_area((0, 2), map_cell, &maze));
     }
 
     #[test]
@@ -3009,18 +3556,15 @@ mod tests {
         let maze = test_maze();
         let center = cell_center(0, 0);
         let mut transform = Transform::from_xyz(center.x, 2.0, center.y);
-        let mut burst = OreBurst {
-            velocity: Vec3::new(120.0, 20.0, 0.0),
-            timer: Timer::from_seconds(0.95, TimerMode::Once),
-        };
+        let mut velocity = Vec3::new(120.0, 20.0, 0.0);
 
-        move_ore_burst_axis(&mut transform, &mut burst, &maze, maze::CELL_SIZE, true);
+        move_burst_axis(&mut transform, &mut velocity, &maze, maze::CELL_SIZE, true);
 
         assert_close(
             transform.translation.x,
             center.x + maze::CELL_SIZE * 0.5 - ORE_WALL_BOUNCE_MARGIN,
         );
-        assert!(burst.velocity.x < 0.0);
+        assert!(velocity.x < 0.0);
         assert!(world_to_cell(transform.translation).is_some_and(|cell| cell == (0, 0)));
     }
 }
