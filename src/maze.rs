@@ -3,11 +3,11 @@ use rand::seq::SliceRandom;
 
 pub const MAZE_COLUMNS: usize = 12;
 pub const MAZE_ROWS: usize = 12;
-pub const CELL_SIZE: f32 = 96.0;
-pub const WALL_HEIGHT: f32 = 72.0;
-pub const WALL_THICKNESS: f32 = 8.0;
-pub const FLOOR_THICKNESS: f32 = 2.0;
-const FOG_HEIGHT: f32 = WALL_HEIGHT - 4.0;
+pub const CELL_SIZE: f32 = 120.0;
+pub const WALL_HEIGHT: f32 = 90.0;
+pub const WALL_THICKNESS: f32 = 10.0;
+pub const FLOOR_THICKNESS: f32 = 2.5;
+const FOG_HEIGHT: f32 = WALL_HEIGHT - 5.0;
 
 #[derive(Component)]
 pub struct Wall;

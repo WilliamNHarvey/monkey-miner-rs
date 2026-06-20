@@ -11,6 +11,11 @@ use maze::{
     WallSegment, cell_center, create_maze, world_to_cell,
 };
 
+const MIN_KEY_SPAWN_DISTANCE: usize = 8;
+const MIN_NAV_PICKUP_SPAWN_DISTANCE: usize = 5;
+const ORE_WALL_BOUNCE_MARGIN: f32 = 10.0;
+const RAT_SPAWN_CELL: (usize, usize) = (MAZE_COLUMNS / 2, MAZE_ROWS / 2);
+
 #[derive(Component)]
 struct Player;
 
@@ -77,6 +82,17 @@ struct CompassText;
 
 #[derive(Component)]
 struct TreasureMapText;
+
+#[derive(Component)]
+struct CompassArrow;
+
+#[derive(Component)]
+struct TreasureMapArrow;
+
+#[derive(Component)]
+struct FloatingMessage {
+    timer: Timer,
+}
 
 #[derive(Component)]
 struct StartScreenRoot;
@@ -188,6 +204,7 @@ struct GameAssets {
     treasure: Handle<Image>,
     treasure_map: Handle<Image>,
     compass: Handle<Image>,
+    nav_arrow: Handle<Image>,
     ore: Handle<Image>,
     key: Handle<Image>,
     locked_door: Handle<Image>,
@@ -255,6 +272,7 @@ fn main() {
                 mine_wall,
                 update_ore_bursts,
                 update_wall_shake,
+                update_floating_messages,
                 rat_movement,
                 toggle_treasure_map,
                 camera_drag,
@@ -324,6 +342,7 @@ fn load_assets(mut game_assets: ResMut<GameAssets>, asset_server: Res<AssetServe
     game_assets.treasure = asset_server.load("images/treasure.png");
     game_assets.treasure_map = asset_server.load("images/treasure_map.png");
     game_assets.compass = asset_server.load("images/compass.png");
+    game_assets.nav_arrow = asset_server.load("images/nav_arrow.png");
     game_assets.ore = asset_server.load("images/ore.png");
     game_assets.key = asset_server.load("images/key.png");
     game_assets.locked_door = asset_server.load("images/locked_door.png");
@@ -377,6 +396,7 @@ fn check_assets_ready(
         ("Treasure texture", &game_assets.treasure),
         ("Treasure map texture", &game_assets.treasure_map),
         ("Compass texture", &game_assets.compass),
+        ("Navigation arrow texture", &game_assets.nav_arrow),
         ("Ore texture", &game_assets.ore),
         ("Key texture", &game_assets.key),
         ("Locked door texture", &game_assets.locked_door),
@@ -625,7 +645,7 @@ fn setup(
     ));
 
     commands.spawn((
-        Text::new("COMPASS\nEXIT ?"),
+        Text::new(String::new()),
         TextFont {
             font_size: 24.0,
             ..default()
@@ -638,6 +658,24 @@ fn setup(
             ..default()
         },
         CompassText,
+    ));
+
+    commands.spawn((
+        ImageNode {
+            image: game_assets.nav_arrow.clone(),
+            color: Color::srgba(1.0, 1.0, 1.0, 0.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(48.0),
+            top: Val::Px(62.0),
+            width: Val::Px(72.0),
+            height: Val::Px(72.0),
+            ..default()
+        },
+        UiTransform::IDENTITY,
+        CompassArrow,
     ));
 
     commands.spawn((
@@ -654,6 +692,24 @@ fn setup(
             ..default()
         },
         TreasureMapText,
+    ));
+
+    commands.spawn((
+        ImageNode {
+            image: game_assets.nav_arrow.clone(),
+            color: Color::srgba(1.0, 1.0, 1.0, 0.0),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(48.0),
+            top: Val::Px(198.0),
+            width: Val::Px(72.0),
+            height: Val::Px(72.0),
+            ..default()
+        },
+        UiTransform::IDENTITY,
+        TreasureMapArrow,
     ));
 
     let monkey_sprite = Sprite3d {
@@ -675,11 +731,11 @@ fn setup(
 
     let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
     let exit_center = cell_center(exit_cell.0, exit_cell.1);
-    let exit_position = Vec3::new(exit_center.x, 34.0, exit_center.y);
+    let exit_position = Vec3::new(exit_center.x, maze::WALL_HEIGHT * 0.47, exit_center.y);
     commands.spawn((
         Sprite::from_image(game_assets.smiley_exit.clone()),
         Sprite3d {
-            pixels_per_metre: 5.0,
+            pixels_per_metre: 4.0,
             alpha_mode: AlphaMode::Blend,
             unlit: true,
             double_sided: true,
@@ -690,7 +746,7 @@ fn setup(
         Billboard,
     ));
 
-    let rat_cell = (MAZE_COLUMNS / 2, MAZE_ROWS / 2);
+    let rat_cell = RAT_SPAWN_CELL;
     let rat_center = cell_center(rat_cell.0, rat_cell.1);
     commands.spawn((
         Sprite::from_image(game_assets.rat.clone()),
@@ -710,6 +766,7 @@ fn setup(
             hunting: false,
             squeak_timer: Timer::from_seconds(0.25, TimerMode::Once),
         },
+        Billboard,
     ));
     info!("Rat enemy spawned at cell {:?}", rat_cell);
 
@@ -739,7 +796,7 @@ fn setup(
     );
     commands.spawn((
         Transform::from_translation(start_position + Vec3::Y * 28.0)
-            .with_rotation(Quat::from_rotation_y(orbit.yaw)),
+            .with_rotation(Quat::from_rotation_y(listener_yaw(orbit.yaw))),
         SpatialListener::new(30.0),
         RatAudioListener,
     ));
@@ -778,6 +835,9 @@ fn cleanup_run(
             With<TreasureMapPickup>,
             With<CompassText>,
             With<TreasureMapText>,
+            With<CompassArrow>,
+            With<TreasureMapArrow>,
+            With<FloatingMessage>,
             With<RatAudioListener>,
         )>,
     >,
@@ -1015,16 +1075,65 @@ fn key_cell_on_exit_route(
     if let Some(route) = route_between(start_cell, exit_cell, maze) {
         let furthest_index = route.len().saturating_sub(2);
         if furthest_index > 0 {
-            let min_index = furthest_index.min(7);
+            let min_index = furthest_index.min(MIN_KEY_SPAWN_DISTANCE);
             let preferred_index = ((route.len() * 3) / 5).clamp(min_index, furthest_index);
-            return route[preferred_index];
+            if let Some(cell) = route[preferred_index..=furthest_index]
+                .iter()
+                .copied()
+                .find(|cell| {
+                    *cell != RAT_SPAWN_CELL
+                        && manhattan_distance(start_cell, *cell) >= MIN_KEY_SPAWN_DISTANCE
+                })
+            {
+                return cell;
+            }
+            if let Some(cell) = route[min_index..=furthest_index]
+                .iter()
+                .copied()
+                .rev()
+                .find(|cell| {
+                    *cell != RAT_SPAWN_CELL
+                        && manhattan_distance(start_cell, *cell) >= MIN_KEY_SPAWN_DISTANCE
+                })
+            {
+                return cell;
+            }
+            return route[furthest_index];
         }
     }
 
-    open_neighbors(start_cell, maze)
-        .into_iter()
-        .find(|cell| *cell != exit_cell)
-        .unwrap_or(start_cell)
+    far_spawn_candidate(start_cell, exit_cell, maze, MIN_KEY_SPAWN_DISTANCE).unwrap_or(start_cell)
+}
+
+fn manhattan_distance(a: (usize, usize), b: (usize, usize)) -> usize {
+    a.0.abs_diff(b.0) + a.1.abs_diff(b.1)
+}
+
+fn far_spawn_candidate(
+    start_cell: (usize, usize),
+    exit_cell: (usize, usize),
+    maze: &MazeMap,
+    min_distance: usize,
+) -> Option<(usize, usize)> {
+    let mut best = None;
+    let mut best_distance = 0;
+    for z in 0..MAZE_ROWS {
+        for x in 0..MAZE_COLUMNS {
+            let cell = (x, z);
+            if cell == start_cell || cell == exit_cell || cell == RAT_SPAWN_CELL {
+                continue;
+            }
+            let distance = manhattan_distance(start_cell, cell);
+            if distance < min_distance || distance <= best_distance {
+                continue;
+            }
+            if route_between(start_cell, cell, maze).is_some() {
+                best = Some(cell);
+                best_distance = distance;
+            }
+        }
+    }
+    best
 }
 
 fn spawn_key_door_and_chests(
@@ -1053,14 +1162,28 @@ fn spawn_key_door_and_chests(
             let door_center = edge_center(door_neighbor, door_direction);
             let vertical = matches!(door_direction, Direction::East | Direction::West);
             let door_mesh = if vertical {
-                meshes.add(Cuboid::new(2.0, 50.0, 78.0))
+                meshes.add(Cuboid::new(
+                    maze::WALL_THICKNESS * 0.25,
+                    maze::WALL_HEIGHT,
+                    maze::CELL_SIZE - maze::WALL_THICKNESS * 2.25,
+                ))
             } else {
-                meshes.add(Cuboid::new(78.0, 50.0, 2.0))
+                meshes.add(Cuboid::new(
+                    maze::CELL_SIZE - maze::WALL_THICKNESS * 2.25,
+                    maze::WALL_HEIGHT,
+                    maze::WALL_THICKNESS * 0.25,
+                ))
             };
             let half_extents = if vertical {
-                Vec2::new(2.0, 39.0)
+                Vec2::new(
+                    maze::WALL_THICKNESS * 0.25,
+                    (maze::CELL_SIZE - maze::WALL_THICKNESS * 2.25) * 0.5,
+                )
             } else {
-                Vec2::new(39.0, 2.0)
+                Vec2::new(
+                    (maze::CELL_SIZE - maze::WALL_THICKNESS * 2.25) * 0.5,
+                    maze::WALL_THICKNESS * 0.25,
+                )
             };
             let door_material = materials.add(StandardMaterial {
                 base_color_texture: Some(game_assets.locked_door.clone()),
@@ -1072,7 +1195,7 @@ fn spawn_key_door_and_chests(
             commands.spawn((
                 Mesh3d(door_mesh),
                 MeshMaterial3d(door_material),
-                Transform::from_xyz(door_center.x, 25.0, door_center.y),
+                Transform::from_xyz(door_center.x, maze::WALL_HEIGHT * 0.5, door_center.y),
                 WallCollider {
                     center: door_center,
                     half_extents,
@@ -1090,6 +1213,7 @@ fn spawn_key_door_and_chests(
                 || (x, z) == start_cell
                 || (x, z) == exit_cell
                 || (x, z) == key_cell
+                || (x, z) == RAT_SPAWN_CELL
             {
                 continue;
             }
@@ -1127,11 +1251,12 @@ fn spawn_navigation_pickups(
     for z in 0..MAZE_ROWS {
         for x in 0..MAZE_COLUMNS {
             let cell = (x, z);
-            if cell == start_cell || cell == exit_cell || cell == key_cell {
+            if cell == start_cell || cell == exit_cell || cell == key_cell || cell == RAT_SPAWN_CELL
+            {
                 continue;
             }
-            let spawn_distance = start_cell.0.abs_diff(x) + start_cell.1.abs_diff(z);
-            if spawn_distance <= 3 {
+            let spawn_distance = manhattan_distance(start_cell, cell);
+            if spawn_distance < MIN_NAV_PICKUP_SPAWN_DISTANCE {
                 continue;
             }
 
@@ -1144,17 +1269,19 @@ fn spawn_navigation_pickups(
 
     let mut rng = rand::thread_rng();
     candidates.shuffle(&mut rng);
-    let compass_cell = candidates.first().copied().unwrap_or(key_cell);
+    let fallback = far_spawn_candidate(start_cell, exit_cell, maze, MIN_NAV_PICKUP_SPAWN_DISTANCE)
+        .unwrap_or(key_cell);
+    let compass_cell = candidates.first().copied().unwrap_or(fallback);
     let treasure_map_cell = candidates
         .iter()
         .copied()
         .find(|cell| *cell != compass_cell)
-        .unwrap_or(start_cell);
+        .unwrap_or(fallback);
 
     let compass_center = cell_center(compass_cell.0, compass_cell.1);
     commands.spawn((
         Sprite::from_image(game_assets.compass.clone()),
-        item_sprite(2.8),
+        item_sprite(5.6),
         Transform::from_xyz(compass_center.x, 2.0, compass_center.y),
         CompassPickup,
         Billboard,
@@ -1454,6 +1581,14 @@ fn update_navigation_ui(
         (&mut Text, &mut TextColor),
         (With<TreasureMapText>, Without<CompassText>),
     >,
+    mut compass_arrow_query: Query<
+        (&mut ImageNode, &mut UiTransform),
+        (With<CompassArrow>, Without<TreasureMapArrow>),
+    >,
+    mut map_arrow_query: Query<
+        (&mut ImageNode, &mut UiTransform),
+        (With<TreasureMapArrow>, Without<CompassArrow>),
+    >,
 ) {
     let Ok(player_transform) = player_query.single() else {
         return;
@@ -1461,19 +1596,24 @@ fn update_navigation_ui(
 
     let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
     let exit_center = cell_center(exit_cell.0, exit_cell.1);
-    let exit_direction =
-        relative_direction_label(player_transform.translation, exit_center, orbit.yaw);
+    let exit_angle = relative_direction_angle(player_transform.translation, exit_center, orbit.yaw);
 
     if let Ok((mut text, mut color)) = compass_query.single_mut() {
         if navigation_state.compass_collected {
-            text.0 = format!("EXIT COMPASS\n   {}", crazy_taxi_arrow(exit_direction));
+            text.0 = "EXIT COMPASS".to_string();
             color.0 = if navigation_state.key_collected {
                 Color::srgb(0.25, 1.0, 0.25)
             } else {
                 Color::srgb(1.0, 0.15, 0.1)
             };
+            if let Ok((mut arrow, mut transform)) = compass_arrow_query.single_mut() {
+                set_ui_arrow(&mut arrow, &mut transform, exit_angle, color.0);
+            }
         } else {
             text.0.clear();
+            if let Ok((mut arrow, _)) = compass_arrow_query.single_mut() {
+                arrow.color = Color::srgba(1.0, 1.0, 1.0, 0.0);
+            }
         }
     }
 
@@ -1483,69 +1623,88 @@ fn update_navigation_ui(
     color.0 = Color::srgb(1.0, 0.84, 0.18);
     if !navigation_state.treasure_map_collected || !navigation_state.show_treasure_map {
         text.0.clear();
+        if let Ok((mut arrow, _)) = map_arrow_query.single_mut() {
+            arrow.color = Color::srgba(1.0, 1.0, 1.0, 0.0);
+        }
         return;
     }
 
-    text.0 = if !navigation_state.key_collected {
+    let map_arrow_angle = if !navigation_state.key_collected {
         if let Some(key_cell) = navigation_state.key_cell {
             let key_center = cell_center(key_cell.0, key_cell.1);
-            let key_direction =
-                relative_direction_label(player_transform.translation, key_center, orbit.yaw);
-            format!("TREASURE\nKEY {}\nM close", crazy_taxi_arrow(key_direction))
+            text.0 = "TREASURE MAP\nKEY".to_string();
+            Some(relative_direction_angle(
+                player_transform.translation,
+                key_center,
+                orbit.yaw,
+            ))
         } else {
-            "TREASURE\nKEY LOST\nM close".to_string()
+            text.0 = "TREASURE MAP\nKEY LOST".to_string();
+            None
         }
     } else if !navigation_state.compass_collected {
         if let Some(compass_cell) = navigation_state.compass_cell {
             let compass_center = cell_center(compass_cell.0, compass_cell.1);
-            let compass_direction =
-                relative_direction_label(player_transform.translation, compass_center, orbit.yaw);
-            format!(
-                "TREASURE\nCOMPASS {}\nM close",
-                crazy_taxi_arrow(compass_direction)
-            )
+            text.0 = "TREASURE MAP\nCOMPASS".to_string();
+            Some(relative_direction_angle(
+                player_transform.translation,
+                compass_center,
+                orbit.yaw,
+            ))
         } else {
-            "TREASURE\nCOMPASS LOST\nM close".to_string()
+            text.0 = "TREASURE MAP\nCOMPASS LOST".to_string();
+            None
         }
     } else {
-        "TREASURE FOUND\nM close".to_string()
+        text.0 = "TREASURE FOUND".to_string();
+        None
     };
-}
 
-fn crazy_taxi_arrow(direction: &str) -> &'static str {
-    match direction {
-        "^" => "^^^",
-        "^>" => "^^>",
-        ">" => ">>>",
-        "v>" => "vv>",
-        "v" => "vvv",
-        "v<" => "<vv",
-        "<" => "<<<",
-        "^<" => "<^^",
-        _ => "HERE",
+    if let Ok((mut arrow, mut transform)) = map_arrow_query.single_mut() {
+        if let Some(angle) = map_arrow_angle {
+            set_ui_arrow(
+                &mut arrow,
+                &mut transform,
+                angle,
+                Color::srgb(1.0, 0.84, 0.18),
+            )
+        } else {
+            arrow.color = Color::srgba(1.0, 1.0, 1.0, 0.0);
+        }
     }
 }
 
-fn relative_direction_label(from: Vec3, target: Vec2, camera_yaw: f32) -> &'static str {
+fn set_ui_arrow(arrow: &mut ImageNode, transform: &mut UiTransform, angle: f32, color: Color) {
+    arrow.color = color;
+    transform.rotation = Rot2::radians(ui_arrow_rotation(angle));
+}
+
+fn ui_arrow_rotation(direction_angle: f32) -> f32 {
+    direction_angle - std::f32::consts::FRAC_PI_2
+}
+
+fn relative_direction_angle(from: Vec3, target: Vec2, camera_yaw: f32) -> f32 {
     let delta = target - Vec2::new(from.x, from.z);
     if delta.length_squared() < 4.0 {
-        return "HERE";
+        return 0.0;
     }
 
     let direction = delta.normalize();
-    let forward = Vec2::new(-camera_yaw.sin(), -camera_yaw.cos()).normalize();
-    let right = Vec2::new(camera_yaw.cos(), -camera_yaw.sin()).normalize();
-    let angle = direction.dot(right).atan2(direction.dot(forward));
-    match ((angle / std::f32::consts::FRAC_PI_4).round() as i32).rem_euclid(8) {
-        0 => "^",
-        1 => "^>",
-        2 => ">",
-        3 => "v>",
-        4 => "v",
-        5 => "v<",
-        6 => "<",
-        _ => "^<",
-    }
+    direction_angle_relative_to_camera(direction, camera_yaw)
+}
+
+fn direction_angle_relative_to_camera(direction: Vec2, camera_yaw: f32) -> f32 {
+    let forward = camera_forward_xz(camera_yaw);
+    let right = camera_right_xz(camera_yaw);
+    direction.dot(right).atan2(direction.dot(forward))
+}
+
+fn camera_forward_xz(camera_yaw: f32) -> Vec2 {
+    Vec2::new(-camera_yaw.sin(), -camera_yaw.cos()).normalize()
+}
+
+fn camera_right_xz(camera_yaw: f32) -> Vec2 {
+    Vec2::new(-camera_yaw.cos(), camera_yaw.sin()).normalize()
 }
 
 fn upgrade_menu_text(run_state: &RunState) -> String {
@@ -1661,10 +1820,6 @@ fn mine_wall(
     if !keyboard.just_pressed(KeyCode::KeyF) {
         return;
     }
-    if run_state.energy == 0 {
-        info!("Out of mining energy; upgrade your pickaxe with ore");
-        return;
-    }
 
     let Ok(player_transform) = player_query.single() else {
         return;
@@ -1692,11 +1847,18 @@ fn mine_wall(
             cell,
             direction.index()
         );
+        spawn_unbreakable_message(&mut commands);
         return;
     };
 
     if !segment.mineable {
         info!("Boundary wall cannot be mined at cell {:?}", cell);
+        spawn_unbreakable_message(&mut commands);
+        return;
+    }
+
+    if run_state.energy == 0 {
+        info!("Out of mining energy; upgrade your pickaxe with ore");
         return;
     }
 
@@ -1747,6 +1909,48 @@ fn mine_wall(
     );
 }
 
+fn spawn_unbreakable_message(commands: &mut Commands) {
+    commands.spawn((
+        Text::new("Unbreakable!"),
+        TextFont {
+            font_size: 34.0,
+            ..default()
+        },
+        TextColor(Color::srgba(1.0, 0.9, 0.1, 1.0)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Percent(50.0),
+            top: Val::Percent(44.0),
+            ..default()
+        },
+        UiTransform::from_translation(Val2::px(-105.0, 0.0)),
+        FloatingMessage {
+            timer: Timer::from_seconds(0.9, TimerMode::Once),
+        },
+    ));
+}
+
+fn update_floating_messages(
+    time: Res<Time>,
+    mut query: Query<(
+        Entity,
+        &mut FloatingMessage,
+        &mut TextColor,
+        &mut UiTransform,
+    )>,
+    mut commands: Commands,
+) {
+    for (entity, mut message, mut color, mut transform) in query.iter_mut() {
+        message.timer.tick(time.delta());
+        let fraction = message.timer.fraction();
+        transform.translation = Val2::px(-105.0, -58.0 * fraction);
+        color.0 = Color::srgba(1.0, 0.9, 0.1, 1.0 - fraction);
+        if message.timer.is_finished() {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
 fn spawn_ore_burst(
     commands: &mut Commands,
     image: Handle<Image>,
@@ -1780,6 +1984,7 @@ fn spawn_ore_burst(
 
 fn update_ore_bursts(
     time: Res<Time>,
+    maze: Res<MazeMap>,
     mut query: Query<(Entity, &mut Transform, &mut OreBurst)>,
     mut commands: Commands,
 ) {
@@ -1787,7 +1992,11 @@ fn update_ore_bursts(
     for (entity, mut transform, mut burst) in query.iter_mut() {
         burst.timer.tick(time.delta());
         burst.velocity.y -= 360.0 * dt;
-        transform.translation += burst.velocity * dt;
+        let x_delta = burst.velocity.x * dt;
+        let z_delta = burst.velocity.z * dt;
+        move_ore_burst_axis(&mut transform, &mut burst, &maze, x_delta, true);
+        move_ore_burst_axis(&mut transform, &mut burst, &maze, z_delta, false);
+        transform.translation.y += burst.velocity.y * dt;
 
         if transform.translation.y <= 2.0 {
             transform.translation.y = 2.0;
@@ -1805,6 +2014,77 @@ fn update_ore_bursts(
             commands.entity(entity).remove::<OreBurst>();
         }
     }
+}
+
+fn move_ore_burst_axis(
+    transform: &mut Transform,
+    burst: &mut OreBurst,
+    maze: &MazeMap,
+    delta: f32,
+    x_axis: bool,
+) {
+    if delta.abs() <= f32::EPSILON {
+        return;
+    }
+
+    let old_position = transform.translation;
+    let mut candidate = old_position;
+    if x_axis {
+        candidate.x += delta;
+    } else {
+        candidate.z += delta;
+    }
+
+    if ore_move_blocked(old_position, candidate, maze) {
+        let Some(cell) = world_to_cell(old_position) else {
+            if x_axis {
+                burst.velocity.x *= -0.55;
+            } else {
+                burst.velocity.z *= -0.55;
+            }
+            return;
+        };
+        let center = cell_center(cell.0, cell.1);
+        let half_cell = maze::CELL_SIZE * 0.5 - ORE_WALL_BOUNCE_MARGIN;
+        if x_axis {
+            burst.velocity.x *= -0.55;
+            transform.translation.x = if delta > 0.0 {
+                center.x + half_cell
+            } else {
+                center.x - half_cell
+            };
+        } else {
+            burst.velocity.z *= -0.55;
+            transform.translation.z = if delta > 0.0 {
+                center.y + half_cell
+            } else {
+                center.y - half_cell
+            };
+        }
+        burst.velocity.y *= 0.9;
+    } else if x_axis {
+        transform.translation.x = candidate.x;
+    } else {
+        transform.translation.z = candidate.z;
+    }
+}
+
+fn ore_move_blocked(old_position: Vec3, candidate: Vec3, maze: &MazeMap) -> bool {
+    let Some(old_cell) = world_to_cell(old_position) else {
+        return true;
+    };
+    let Some(new_cell) = world_to_cell(candidate) else {
+        return true;
+    };
+    if old_cell == new_cell {
+        return false;
+    }
+
+    let Some(direction) = direction_between(old_cell, new_cell) else {
+        return true;
+    };
+    maze.cells[old_cell.1][old_cell.0].walls[direction.index()]
+        || maze.cells[new_cell.1][new_cell.0].walls[direction.opposite().index()]
 }
 
 fn facing_direction(yaw: f32) -> Direction {
@@ -1958,7 +2238,11 @@ fn update_audio_listener(
     };
 
     listener_transform.translation = player_transform.translation + Vec3::Y * 28.0;
-    listener_transform.rotation = Quat::from_rotation_y(orbit.yaw);
+    listener_transform.rotation = Quat::from_rotation_y(listener_yaw(orbit.yaw));
+}
+
+fn listener_yaw(camera_yaw: f32) -> f32 {
+    camera_yaw + std::f32::consts::PI
 }
 
 fn rat_movement(
@@ -1992,7 +2276,8 @@ fn rat_movement(
             return;
         }
 
-        if rat.cell == rat.target_cell {
+        let same_player_cell = player_cell.is_some_and(|cell| cell == rat.cell);
+        if !same_player_cell && rat.cell == rat.target_cell {
             if let Some(player_cell) = player_cell {
                 if !rat.hunting {
                     rat.hunting = true;
@@ -2005,17 +2290,23 @@ fn rat_movement(
             }
         }
 
-        let target_center = cell_center(rat.target_cell.0, rat.target_cell.1);
-        let target = Vec3::new(target_center.x, transform.translation.y, target_center.y);
+        let target = if same_player_cell {
+            Vec3::new(player_xz.x, transform.translation.y, player_xz.y)
+        } else {
+            let target_center = cell_center(rat.target_cell.0, rat.target_cell.1);
+            Vec3::new(target_center.x, transform.translation.y, target_center.y)
+        };
         let to_target = target - transform.translation;
         let distance = to_target.length();
 
         if distance <= 2.0 {
-            if rat.cell != rat.target_cell {
+            if !same_player_cell && rat.cell != rat.target_cell {
                 rat.last_direction = direction_between(rat.cell, rat.target_cell);
                 rat.cell = rat.target_cell;
             }
-            rat.target_cell = rat.cell;
+            if !same_player_cell {
+                rat.target_cell = rat.cell;
+            }
             continue;
         }
 
@@ -2069,11 +2360,7 @@ fn rat_squeaks(
         } else {
             game_assets.rat_squeak_sound.clone()
         };
-        let volume = if use_echo {
-            0.62 - distance_t * 0.14
-        } else {
-            1.05 - distance_t * 0.22
-        };
+        let volume = rat_squeak_volume(use_echo, distance_t);
         let speed = if use_echo {
             rng.gen_range(0.82..=0.96)
         } else {
@@ -2088,12 +2375,20 @@ fn rat_squeaks(
         commands.spawn((
             AudioPlayer(sound),
             PlaybackSettings::DESPAWN
-                .with_volume(Volume::Linear(volume.clamp(0.26, 1.0)))
+                .with_volume(Volume::Linear(volume))
                 .with_speed(speed)
                 .with_spatial(true)
                 .with_spatial_scale(SpatialScale::new(spatial_scale)),
             Transform::from_translation(sound_position),
         ));
+    }
+}
+
+fn rat_squeak_volume(use_echo: bool, distance_t: f32) -> f32 {
+    if use_echo {
+        (0.20 - distance_t.clamp(0.0, 1.0) * 0.10).clamp(0.05, 0.22)
+    } else {
+        (1.25 - distance_t.clamp(0.0, 1.0) * 0.12).clamp(0.85, 1.30)
     }
 }
 
@@ -2586,4 +2881,125 @@ fn cardinal_directions() -> [(Direction, isize, isize); 4] {
         (Direction::South, 0, -1),
         (Direction::West, -1, 0),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_maze() -> MazeMap {
+        MazeMap {
+            cells: [[maze::MazeCell { walls: [true; 4] }; MAZE_COLUMNS]; MAZE_ROWS],
+        }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn arrow_angles_are_continuous_relative_to_camera() {
+        let yaw = std::f32::consts::PI;
+
+        assert_close(
+            direction_angle_relative_to_camera(Vec2::new(0.0, 1.0), yaw),
+            0.0,
+        );
+        assert_close(
+            direction_angle_relative_to_camera(Vec2::new(1.0, 0.0), yaw),
+            std::f32::consts::FRAC_PI_2,
+        );
+        assert_close(
+            direction_angle_relative_to_camera(Vec2::new(-1.0, 0.0), yaw),
+            -std::f32::consts::FRAC_PI_2,
+        );
+
+        let diagonal = direction_angle_relative_to_camera(Vec2::new(1.0, 1.0).normalize(), yaw);
+        assert_close(diagonal, std::f32::consts::FRAC_PI_4);
+    }
+
+    #[test]
+    fn ui_arrow_rotation_accounts_for_right_facing_texture() {
+        assert_close(ui_arrow_rotation(0.0), -std::f32::consts::FRAC_PI_2);
+        assert_close(ui_arrow_rotation(std::f32::consts::FRAC_PI_2), 0.0);
+        assert_close(
+            ui_arrow_rotation(-std::f32::consts::FRAC_PI_2),
+            -std::f32::consts::PI,
+        );
+    }
+
+    #[test]
+    fn listener_right_ear_matches_camera_right() {
+        for yaw in [
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+            std::f32::consts::FRAC_PI_2 * 3.0,
+        ] {
+            let listener_right = Quat::from_rotation_y(listener_yaw(yaw)) * Vec3::X;
+            let expected = camera_right_xz(yaw);
+            assert_close(listener_right.x, expected.x);
+            assert_close(listener_right.z, expected.y);
+        }
+    }
+
+    #[test]
+    fn audio_side_math_tracks_camera_turns() {
+        let source_east = Vec2::new(1.0, 0.0);
+
+        assert!(direction_angle_relative_to_camera(source_east, std::f32::consts::PI) > 0.0);
+        assert!(direction_angle_relative_to_camera(source_east, 0.0) < 0.0);
+    }
+
+    #[test]
+    fn echo_squeaks_are_much_quieter_than_direct_squeaks() {
+        let near_corner_echo = rat_squeak_volume(true, 2.0 / 12.0);
+        let near_direct = rat_squeak_volume(false, 2.0 / 12.0);
+        let far_echo = rat_squeak_volume(true, 1.0);
+
+        assert!(near_corner_echo < 0.20);
+        assert!(far_echo <= 0.10);
+        assert!(near_direct > 1.20);
+        assert!(near_direct > near_corner_echo * 6.0);
+    }
+
+    #[test]
+    fn ore_burst_crossing_respects_maze_walls() {
+        let mut maze = test_maze();
+        maze.cells[0][0].walls[Direction::East.index()] = false;
+        maze.cells[0][1].walls[Direction::West.index()] = false;
+
+        let old_position = Vec3::new(cell_center(0, 0).x, 2.0, cell_center(0, 0).y);
+        let open_candidate = Vec3::new(cell_center(1, 0).x, 2.0, cell_center(1, 0).y);
+        assert!(!ore_move_blocked(old_position, open_candidate, &maze));
+
+        maze.cells[0][0].walls[Direction::East.index()] = true;
+        assert!(ore_move_blocked(old_position, open_candidate, &maze));
+
+        let out_of_bounds = old_position - Vec3::X * maze::CELL_SIZE;
+        assert!(ore_move_blocked(old_position, out_of_bounds, &maze));
+    }
+
+    #[test]
+    fn ore_burst_bounces_back_inside_cell_when_it_hits_wall() {
+        let maze = test_maze();
+        let center = cell_center(0, 0);
+        let mut transform = Transform::from_xyz(center.x, 2.0, center.y);
+        let mut burst = OreBurst {
+            velocity: Vec3::new(120.0, 20.0, 0.0),
+            timer: Timer::from_seconds(0.95, TimerMode::Once),
+        };
+
+        move_ore_burst_axis(&mut transform, &mut burst, &maze, maze::CELL_SIZE, true);
+
+        assert_close(
+            transform.translation.x,
+            center.x + maze::CELL_SIZE * 0.5 - ORE_WALL_BOUNCE_MARGIN,
+        );
+        assert!(burst.velocity.x < 0.0);
+        assert!(world_to_cell(transform.translation).is_some_and(|cell| cell == (0, 0)));
+    }
 }
