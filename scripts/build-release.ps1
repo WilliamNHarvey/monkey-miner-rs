@@ -1,5 +1,9 @@
 $ErrorActionPreference = "Stop"
 
+if (-not $IsWindows) {
+    throw "scripts/build-release.ps1 builds a native Windows .exe and must be run on Windows. Use scripts/build-release.sh or make package on macOS/Linux."
+}
+
 $RootDir = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $RootDir
 

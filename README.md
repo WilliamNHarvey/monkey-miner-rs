@@ -33,15 +33,16 @@ The real maze is larger and generated at runtime, but a run starts with this kin
 
 ```text
 #############
-#P..M#.....T#
+#P..T#...O..#
 ###..#.###..#
-#....#O..#..#
-#.######.#D##
+#?...#...#..#
+#.####.#.#..#
+#T..C#.#.#..#
+#.XX.#.#R#..#
+#..#.#.###..#
+#..#...@.#K.#
+#O.#####.#D##
 #T....C#.#G.#
-#.####.#.####
-#....#.#..K.#
-####.#.###R.#
-#..T.#......#
 #############
 ```
 
@@ -59,8 +60,9 @@ Legend:
 | `T` | Treasure |
 | `C` | Chest |
 | `O` | Ore-deposit wall |
-| `M` | Treasure map pickup |
-| Compass | Compass pickup that unlocks the exit compass UI |
+| `?` | Treasure map pickup |
+| `@` | Compass pickup that unlocks the exit compass UI |
+| `X` | Hard or unbreakable wall, if present in a generated run |
 
 ## Controls
 
@@ -182,7 +184,21 @@ dist/monkey-miner-darwin-x86_64/monkey-miner
 
 ### Windows `.exe`
 
-Build the Windows executable on a Windows machine with Rust installed:
+From macOS/Linux, install the Windows Rust target and MinGW linker, then package the Windows build:
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+brew install mingw-w64
+make package-windows
+```
+
+That creates:
+
+```sh
+dist/monkey-miner-windows-x86_64/monkey-miner.exe
+```
+
+You can also build the Windows executable natively on a Windows machine with Rust installed:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
@@ -200,13 +216,7 @@ Run it with:
 dist\monkey-miner-windows-x86_64\monkey-miner.exe
 ```
 
-There is also a Makefile target for environments that have both `make` and PowerShell:
-
-```sh
-make package-windows
-```
-
-For this Bevy prototype, native packaging is the reliable path. Cross-compiling a Windows `.exe` from macOS is possible in theory, but it usually requires extra linker and Windows SDK setup that is not worth baking into this repo yet.
+The macOS/Linux cross-build uses the GNU Windows target. If the command fails before building, install whichever prerequisite the script reports as missing.
 
 `dist/` is ignored because it is generated output and the release binary is large.
 
