@@ -15,6 +15,8 @@ const MIN_KEY_SPAWN_DISTANCE: usize = 8;
 const MIN_NAV_PICKUP_SPAWN_DISTANCE: usize = 5;
 const ORE_WALL_BOUNCE_MARGIN: f32 = 10.0;
 const RAT_SPAWN_CELL: (usize, usize) = (MAZE_COLUMNS / 2, MAZE_ROWS / 2);
+const STARTING_TRAIL_MARKERS: u32 = 5;
+const TRAIL_MARKERS_PER_TREASURE: u32 = 2;
 
 #[derive(Component)]
 struct Player;
@@ -118,6 +120,7 @@ struct RunState {
     treasure: u32,
     total_treasure: u32,
     ore: u32,
+    markers: u32,
     mined_walls: u32,
     keys: u32,
     doors_unlocked: u32,
@@ -546,6 +549,7 @@ fn setup(
 
     run_state.treasure = 0;
     run_state.ore = 0;
+    run_state.markers = STARTING_TRAIL_MARKERS;
     run_state.mined_walls = 0;
     run_state.keys = 0;
     run_state.doors_unlocked = 0;
@@ -1333,11 +1337,12 @@ fn collect_treasure(
         let treasure_xz = Vec2::new(transform.translation.x, transform.translation.z);
         if player_xz.distance(treasure_xz) < 28.0 {
             run_state.treasure += treasure.value;
+            run_state.markers += TRAIL_MARKERS_PER_TREASURE;
             commands.entity(entity).despawn();
             play_sound(&mut commands, game_assets.pickup_sound.clone());
             info!(
-                "Collected treasure {}/{}",
-                run_state.treasure, run_state.total_treasure
+                "Collected treasure {}/{}; markers {}",
+                run_state.treasure, run_state.total_treasure, run_state.markers
             );
         }
     }
@@ -1532,10 +1537,11 @@ fn hud_text(run_state: &RunState, navigation_state: &NavigationState) -> String 
         "  Find compass"
     };
     format!(
-        "Treasure: {}/{}  Ore: {}  Keys: {}  Energy: {}/{}\nMining: {}  Speed: {}  Mined: {}  Time: {:.0}s\nScore: {}  Best: {}\nQ/E: turn  T: marker  F: mine  U: upgrades{}{}{}\n{}",
+        "Treasure: {}/{}  Ore: {}  Markers: {}  Keys: {}  Energy: {}/{}\nMining: {}  Speed: {}  Mined: {}  Time: {:.0}s\nScore: {}  Best: {}\nQ/E: turn  T: marker  F: mine  U: upgrades{}{}{}\n{}",
         run_state.treasure,
         run_state.total_treasure,
         run_state.ore,
+        run_state.markers,
         run_state.keys,
         run_state.energy,
         run_state.max_energy,
@@ -2165,6 +2171,7 @@ fn drop_trail_marker(
     player_query: Query<&Transform, With<Player>>,
     mut markers: ResMut<TrailMarkers>,
     game_assets: Res<GameAssets>,
+    mut run_state: ResMut<RunState>,
     mut commands: Commands,
 ) {
     if !keyboard.just_pressed(KeyCode::KeyT) {
@@ -2181,7 +2188,12 @@ fn drop_trail_marker(
         info!("Trail marker already exists at cell {:?}", cell);
         return;
     }
+    if run_state.markers == 0 {
+        info!("No trail markers left; collect treasure for more");
+        return;
+    }
 
+    run_state.markers -= 1;
     markers.marked[cell.1][cell.0] = true;
     let center = cell_center(cell.0, cell.1);
     commands.spawn((

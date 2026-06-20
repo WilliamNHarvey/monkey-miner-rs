@@ -6,17 +6,18 @@ Monkey Miner is a small 3D maze game built with Rust and Bevy. You play a miner 
 
 ## Current Game
 
-Each run starts in one corner of a connected maze. The exit is in the far corner, but the path is blocked by a locked door. A key spawns near the start. Treasures and chests are scattered through dead ends. Internal walls can be mined to create shortcuts or escape routes.
+Each run starts in one corner of a connected maze. The exit is in the far corner, but the path is blocked by a locked door. The key spawns deeper in the maze on the route to the exit, away from both the player spawn and the rat. Treasures, chests, ore-deposit walls, a compass, and a treasure map are scattered through the maze. Mine internal walls to create shortcuts or escape routes, but boundary walls are unbreakable.
 
-The maze is randomized every time you restart a run.
+The maze is randomized every time you restart a run. The rooms are intentionally roomy, but fog, the roof, the rat, and limited resources keep the route tense.
 
 ```mermaid
 flowchart LR
     Start[Start in corner] --> Explore[Explore maze]
-    Explore --> Collect[Collect key, treasure, ore]
-    Explore --> Mine[Mine shortcut walls]
-    Mine --> Ore[Pick up ore]
-    Ore --> Upgrade[Upgrade pickaxe]
+    Explore --> Collect[Collect key, treasure, compass, map]
+    Explore --> Mine[Mine shortcut and ore-deposit walls]
+    Mine --> Ore[Pick up ore nuggets]
+    Ore --> Upgrade[Upgrade mining or speed]
+    Collect --> Markers[Earn trail markers from treasure]
     Collect --> Door[Unlock exit door]
     Door --> Exit[Reach smiley exit]
     Explore --> Rat[Stay ahead of the rat]
@@ -28,17 +29,17 @@ flowchart LR
 
 ## Example Maze Layout
 
-The real maze is larger and generated at runtime, but a run starts with this kind of structure. The player begins near one corner, the exit is far away, and the door/key placement forces at least a little exploration before escape.
+The real maze is larger and generated at runtime, but a run starts with this kind of structure. The player begins near one corner, the exit is far away, the key is on the route to the door, and navigation pickups help only after you find them.
 
 ```text
 #############
-#P..K#.....T#
+#P..M#.....T#
 ###..#.###..#
-#....#...#..#
+#....#O..#..#
 #.######.#D##
 #T....C#.#G.#
 #.####.#.####
-#....#.#....#
+#....#.#..K.#
 ####.#.###R.#
 #..T.#......#
 #############
@@ -57,8 +58,9 @@ Legend:
 | `R` | Rat enemy |
 | `T` | Treasure |
 | `C` | Chest |
-| Compass | Unlocks the exit compass UI |
-| Map | Unlocks the treasure map UI |
+| `O` | Ore-deposit wall |
+| `M` | Treasure map pickup |
+| Compass | Compass pickup that unlocks the exit compass UI |
 
 ## Controls
 
@@ -68,7 +70,7 @@ Legend:
 | `A` / `D` | Strafe left / right |
 | Mouse drag | Orbit camera |
 | `Q` / `E` | Turn camera left / right |
-| `T` | Drop a trail marker in the current maze cell |
+| `T` | Drop a trail marker in the current maze cell, if you have one |
 | `F` | Mine the wall you are facing |
 | `U` | Open / close upgrade menu |
 | `M` | Open / close treasure map after finding it |
@@ -79,7 +81,11 @@ Legend:
 
 ## Mining And Upgrades
 
-Mining consumes energy. If energy hits zero, upgrade mining with ore to keep opening shortcuts. Ore comes from chests and special ore-deposit walls, and can also be spent on movement speed if you want a faster escape route instead.
+Mining consumes energy. If energy hits zero, upgrade mining with ore to keep opening shortcuts. Ore comes from chests and special ore-deposit walls. Normal walls do not drop ore, and boundary walls cannot be mined.
+
+Ore-deposit walls burst into bouncing nuggets. Nuggets settle before they can be collected, and bounce off maze walls instead of passing through them.
+
+Ore can also be spent on movement speed if you want a faster escape route instead.
 
 Upgrade rules:
 
@@ -87,6 +93,17 @@ Upgrade rules:
 | --- | --- | --- |
 | Mining energy | Current mining level in ore | Mining level +1, max energy +1, energy refills |
 | Movement speed | Current speed level in ore | Speed level +1, movement speed increases |
+
+## Navigation Tools
+
+You start with 5 trail markers. Dropping a marker spends 1 marker and marks the current cell. Each loose treasure adds 2 more markers.
+
+The compass and treasure map are world pickups, not free HUD features:
+
+| Tool | Behavior |
+| --- | --- |
+| Compass | Shows an exit arrow after you find the compass pickup. The arrow is red until you have the key, then green. |
+| Treasure map | Toggle with `M` after pickup. It points to the key first, then to the compass if the key is collected but the compass is still missing. |
 
 ## Scoring
 
@@ -210,4 +227,4 @@ For this Bevy prototype, native packaging is the reliable path. Cross-compiling 
 
 ## Notes
 
-This is still a prototype. The core loop works: explore, collect, mine, upgrade, unlock, escape, or restart after the rat catches you.
+This is still a prototype. The core loop works: explore, collect, place markers, mine, upgrade, unlock, escape, or restart after the rat catches you.
