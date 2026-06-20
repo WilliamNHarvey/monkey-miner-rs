@@ -68,22 +68,22 @@ Legend:
 | `Q` / `E` | Turn camera left / right |
 | `T` | Drop a trail marker in the current maze cell |
 | `F` | Mine the wall you are facing |
-| `U` | Upgrade pickaxe if you have enough ore |
+| `U` | Open / close upgrade menu |
+| `Up` / `Down` | Select upgrade while the menu is open |
+| `Enter` / `Space` | Buy selected upgrade while the menu is open |
+| `Esc` | Close upgrade menu |
 | `R` | Restart after winning or getting caught |
 
 ## Mining And Upgrades
 
-Mining consumes energy. If energy hits zero, upgrade the pickaxe with ore to continue mining.
+Mining consumes energy. If energy hits zero, upgrade mining with ore to keep opening shortcuts. Ore can also be spent on movement speed if you want a faster escape route instead.
 
 Upgrade rules:
 
-| Stat | Effect |
-| --- | --- |
-| Cost | Current pickaxe level in ore |
-| Pickaxe level | Increases by 1 |
-| Max energy | Increases by 1 |
-| Energy | Refills to the new max |
-| Ore yield | Mined walls drop ore equal to current pickaxe level |
+| Upgrade | Cost | Effect |
+| --- | --- | --- |
+| Mining energy | Current mining level in ore | Mining level +1, max energy +1, energy refills, mined walls drop more ore |
+| Movement speed | Current speed level in ore | Speed level +1, movement speed increases |
 
 ## Scoring
 

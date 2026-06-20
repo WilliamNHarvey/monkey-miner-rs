@@ -1,6 +1,8 @@
+use bevy::audio::{SpatialScale, Volume};
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
 use bevy_sprite3d::prelude::*;
+use rand::Rng;
 use rand::seq::SliceRandom;
 use std::collections::VecDeque;
 mod maze;
@@ -27,6 +29,7 @@ struct Rat {
     target_cell: (usize, usize),
     last_direction: Option<Direction>,
     hunting: bool,
+    squeak_timer: Timer,
 }
 
 #[derive(Component)]
@@ -43,6 +46,12 @@ struct Ore {
 }
 
 #[derive(Component)]
+struct OreBurst {
+    velocity: Vec3,
+    timer: Timer,
+}
+
+#[derive(Component)]
 struct KeyPickup;
 
 #[derive(Component)]
@@ -53,6 +62,21 @@ struct Chest;
 
 #[derive(Component)]
 struct HudText;
+
+#[derive(Component)]
+struct UpgradeMenuText;
+
+#[derive(Component)]
+struct StartScreenRoot;
+
+#[derive(Component)]
+struct StartPrompt;
+
+#[derive(Component)]
+struct WallShake {
+    timer: Timer,
+    original: Vec3,
+}
 
 #[derive(Component)]
 struct Billboard;
@@ -71,6 +95,9 @@ struct RunState {
     energy: u32,
     max_energy: u32,
     pickaxe_level: u32,
+    speed_level: u32,
+    upgrade_menu_open: bool,
+    upgrade_selection: usize,
     elapsed_seconds: f32,
     score: u32,
     best_score: u32,
@@ -84,8 +111,8 @@ struct TrailMarkers {
 }
 
 #[derive(Resource)]
-struct MiningAssets {
-    ore_image: Handle<Image>,
+struct HardWallAssets {
+    textures: [Handle<Image>; 3],
 }
 
 #[derive(Resource)]
@@ -123,8 +150,13 @@ impl Default for FogMemory {
 struct GameAssets {
     monkey: Handle<Image>,
     wall: Handle<Image>,
+    ore_wall: Handle<Image>,
+    hard_wall: Handle<Image>,
+    hard_wall_cracked_1: Handle<Image>,
+    hard_wall_cracked_2: Handle<Image>,
     floor: Handle<Image>,
     roof: Handle<Image>,
+    cover: Handle<Image>,
     smiley_exit: Handle<Image>,
     rat: Handle<Image>,
     treasure: Handle<Image>,
@@ -140,6 +172,8 @@ struct GameAssets {
     upgrade_sound: Handle<AudioSource>,
     marker_sound: Handle<AudioSource>,
     catch_sound: Handle<AudioSource>,
+    rat_squeak_sound: Handle<AudioSource>,
+    rat_squeak_echo_sound: Handle<AudioSource>,
     win_sound: Handle<AudioSource>,
     loaded: bool,
 }
@@ -149,6 +183,7 @@ struct GameAssets {
 enum GameState {
     #[default]
     Loading,
+    Start,
     Ready,
     Restarting,
 }
@@ -174,8 +209,14 @@ fn main() {
             Update,
             check_assets_ready.run_if(in_state(GameState::Loading)),
         )
+        .add_systems(OnEnter(GameState::Start), setup_start_screen)
+        .add_systems(OnExit(GameState::Start), cleanup_start_screen)
         .add_systems(OnEnter(GameState::Ready), setup)
         .add_systems(OnEnter(GameState::Restarting), cleanup_run)
+        .add_systems(
+            Update,
+            (start_screen_input, blink_start_prompt).run_if(in_state(GameState::Start)),
+        )
         .add_systems(
             Update,
             (
@@ -183,11 +224,20 @@ fn main() {
                 player_movement,
                 drop_trail_marker,
                 mine_wall,
+                update_ore_bursts,
+                update_wall_shake,
                 rat_movement,
+                rat_squeaks,
                 camera_drag,
                 camera_follow,
                 billboard_to_camera,
                 update_fog,
+            )
+                .run_if(in_state(GameState::Ready)),
+        )
+        .add_systems(
+            Update,
+            (
                 collect_treasure,
                 collect_ore,
                 collect_key,
@@ -227,10 +277,15 @@ fn asset_file_path() -> String {
 
 fn load_assets(mut game_assets: ResMut<GameAssets>, asset_server: Res<AssetServer>) {
     info!("Loading assets...");
-    game_assets.monkey = asset_server.load("images/monkey.png");
+    game_assets.monkey = asset_server.load("images/monkey_red_shirt.png");
     game_assets.wall = asset_server.load("images/wall.png");
+    game_assets.ore_wall = asset_server.load("images/ore_wall.png");
+    game_assets.hard_wall = asset_server.load("images/hard_wall.png");
+    game_assets.hard_wall_cracked_1 = asset_server.load("images/hard_wall_cracked_1.png");
+    game_assets.hard_wall_cracked_2 = asset_server.load("images/hard_wall_cracked_2.png");
     game_assets.floor = asset_server.load("images/floor.png");
     game_assets.roof = asset_server.load("images/roof.png");
+    game_assets.cover = asset_server.load("images/monkey-miner-cover.png");
     game_assets.smiley_exit = asset_server.load("images/smiley_exit.png");
     game_assets.rat = asset_server.load("images/rat.png");
     game_assets.treasure = asset_server.load("images/treasure.png");
@@ -246,6 +301,8 @@ fn load_assets(mut game_assets: ResMut<GameAssets>, asset_server: Res<AssetServe
     game_assets.upgrade_sound = asset_server.load("audio/upgrade.ogg");
     game_assets.marker_sound = asset_server.load("audio/marker.ogg");
     game_assets.catch_sound = asset_server.load("audio/catch.ogg");
+    game_assets.rat_squeak_sound = asset_server.load("audio/rat_squeak.ogg");
+    game_assets.rat_squeak_echo_sound = asset_server.load("audio/rat_squeak_echo.ogg");
     game_assets.win_sound = asset_server.load("audio/win.ogg");
 }
 
@@ -267,8 +324,19 @@ fn check_assets_ready(
     let images_loaded = [
         ("Monkey texture", &game_assets.monkey),
         ("Wall texture", &game_assets.wall),
+        ("Ore wall texture", &game_assets.ore_wall),
+        ("Hard wall texture", &game_assets.hard_wall),
+        (
+            "Hard wall crack 1 texture",
+            &game_assets.hard_wall_cracked_1,
+        ),
+        (
+            "Hard wall crack 2 texture",
+            &game_assets.hard_wall_cracked_2,
+        ),
         ("Floor texture", &game_assets.floor),
         ("Roof texture", &game_assets.roof),
+        ("Cover texture", &game_assets.cover),
         ("Smiley exit texture", &game_assets.smiley_exit),
         ("Rat texture", &game_assets.rat),
         ("Treasure texture", &game_assets.treasure),
@@ -288,6 +356,8 @@ fn check_assets_ready(
         ("Upgrade sound", &game_assets.upgrade_sound),
         ("Marker sound", &game_assets.marker_sound),
         ("Catch sound", &game_assets.catch_sound),
+        ("Rat squeak sound", &game_assets.rat_squeak_sound),
+        ("Rat squeak echo sound", &game_assets.rat_squeak_echo_sound),
         ("Win sound", &game_assets.win_sound),
     ]
     .into_iter()
@@ -296,7 +366,85 @@ fn check_assets_ready(
     if images_loaded && sounds_loaded {
         info!("All assets loaded successfully!");
         game_assets.loaded = true;
+        next_state.set(GameState::Start);
+    }
+}
+
+fn setup_start_screen(mut commands: Commands, game_assets: Res<GameAssets>) {
+    commands.spawn((Camera2d, StartScreenRoot));
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.02, 0.015, 0.01)),
+            StartScreenRoot,
+        ))
+        .with_children(|parent| {
+            parent
+                .spawn(Node {
+                    width: Val::Px(650.0),
+                    height: Val::Px(650.0),
+                    position_type: PositionType::Relative,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    ..default()
+                })
+                .with_children(|cover| {
+                    cover.spawn((
+                        ImageNode::new(game_assets.cover.clone()),
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Percent(100.0),
+                            position_type: PositionType::Absolute,
+                            ..default()
+                        },
+                    ));
+                    cover.spawn((
+                        Text::new("Press Enter to mine"),
+                        TextFont {
+                            font_size: 34.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgba(1.0, 0.92, 0.25, 1.0)),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            bottom: Val::Px(30.0),
+                            ..default()
+                        },
+                        StartPrompt,
+                    ));
+                });
+        });
+}
+
+fn start_screen_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
         next_state.set(GameState::Ready);
+    }
+}
+
+fn cleanup_start_screen(mut commands: Commands, query: Query<Entity, With<StartScreenRoot>>) {
+    for entity in query.iter() {
+        commands.entity(entity).despawn();
+    }
+}
+
+fn blink_start_prompt(time: Res<Time>, mut query: Query<&mut TextColor, With<StartPrompt>>) {
+    let alpha = if (time.elapsed_secs() * 2.3).sin() > 0.0 {
+        1.0
+    } else {
+        0.22
+    };
+    for mut color in query.iter_mut() {
+        color.0 = Color::srgba(1.0, 0.92, 0.25, alpha);
     }
 }
 
@@ -304,6 +452,7 @@ fn setup(
     mut commands: Commands,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
+    mut orbit: ResMut<CameraOrbit>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -312,6 +461,12 @@ fn setup(
     let (start_position, maze_map) = create_maze(
         &mut commands,
         game_assets.wall.clone(),
+        game_assets.ore_wall.clone(),
+        [
+            game_assets.hard_wall.clone(),
+            game_assets.hard_wall_cracked_1.clone(),
+            game_assets.hard_wall_cracked_2.clone(),
+        ],
         game_assets.floor.clone(),
         game_assets.roof.clone(),
         &mut meshes,
@@ -319,6 +474,17 @@ fn setup(
     );
 
     info!("Monkey starting position: {:?}", start_position);
+    let spawn_cell = world_to_cell(start_position).unwrap_or((0, 0));
+    let spawn_direction = best_spawn_direction(spawn_cell, &maze_map);
+    let spawn_yaw = yaw_for_direction(spawn_direction);
+    let default_orbit = CameraOrbit::default();
+    orbit.yaw = spawn_yaw;
+    orbit.pitch = default_orbit.pitch;
+    orbit.distance = default_orbit.distance;
+    info!(
+        "Spawn facing {:?} toward the more open maze direction",
+        spawn_direction.index()
+    );
 
     run_state.treasure = 0;
     run_state.ore = 0;
@@ -330,6 +496,9 @@ fn setup(
     run_state.max_energy = 3;
     run_state.energy = run_state.max_energy;
     run_state.pickaxe_level = 1;
+    run_state.speed_level = 1;
+    run_state.upgrade_menu_open = false;
+    run_state.upgrade_selection = 0;
     run_state.elapsed_seconds = 0.0;
     run_state.score = 0;
     run_state.score_finalized = false;
@@ -340,18 +509,21 @@ fn setup(
         image: game_assets.trail_marker.clone(),
     });
 
-    commands.insert_resource(MiningAssets {
-        ore_image: game_assets.ore.clone(),
+    commands.insert_resource(HardWallAssets {
+        textures: [
+            game_assets.hard_wall.clone(),
+            game_assets.hard_wall_cracked_1.clone(),
+            game_assets.hard_wall_cracked_2.clone(),
+        ],
     });
 
-    let total_treasure = spawn_treasures(
+    let loose_treasure = spawn_treasures(
         &mut commands,
         &maze_map,
         game_assets.treasure.clone(),
         start_position,
     );
-    run_state.total_treasure = total_treasure;
-    spawn_key_door_and_chests(
+    let chest_treasure = spawn_key_door_and_chests(
         &mut commands,
         &maze_map,
         start_position,
@@ -359,6 +531,7 @@ fn setup(
         &mut meshes,
         &mut materials,
     );
+    run_state.total_treasure = loose_treasure + chest_treasure;
 
     commands.spawn((
         Text::new(hud_text(&run_state)),
@@ -376,6 +549,22 @@ fn setup(
         HudText,
     ));
 
+    commands.spawn((
+        Text::new(upgrade_menu_text(&run_state)),
+        TextFont {
+            font_size: 22.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.95, 0.95, 0.75)),
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(20.0),
+            top: Val::Px(18.0),
+            ..default()
+        },
+        UpgradeMenuText,
+    ));
+
     let monkey_sprite = Sprite3d {
         pixels_per_metre: 12.0,
         alpha_mode: AlphaMode::Mask(0.5),
@@ -388,7 +577,8 @@ fn setup(
     commands.spawn((
         Sprite::from_image(game_assets.monkey.clone()),
         monkey_sprite,
-        Transform::from_translation(start_position),
+        Transform::from_translation(start_position)
+            .with_rotation(Quat::from_rotation_y(spawn_yaw - std::f32::consts::PI)),
         Player,
     ));
 
@@ -427,6 +617,7 @@ fn setup(
             target_cell: rat_cell,
             last_direction: None,
             hunting: false,
+            squeak_timer: Timer::from_seconds(0.25, TimerMode::Once),
         },
     ));
     info!("Rat enemy spawned at cell {:?}", rat_cell);
@@ -448,10 +639,17 @@ fn setup(
         PlayerLight,
     ));
 
+    let target = start_position + Vec3::Y * 28.0;
+    let horizontal_distance = orbit.distance * orbit.pitch.cos();
+    let camera_offset = Vec3::new(
+        orbit.yaw.sin() * horizontal_distance,
+        orbit.distance * orbit.pitch.sin() + 20.0,
+        orbit.yaw.cos() * horizontal_distance,
+    );
     commands.spawn((
         Camera3d::default(),
-        Transform::from_translation(start_position + Vec3::new(0.0, 80.0, -180.0))
-            .looking_at(start_position + Vec3::Y * 24.0, Vec3::Y),
+        Transform::from_translation(target + camera_offset).looking_at(target, Vec3::Y),
+        SpatialListener::new(18.0),
         FollowCamera,
     ));
 }
@@ -473,6 +671,7 @@ fn cleanup_run(
             With<LockedDoor>,
             With<Chest>,
             With<HudText>,
+            With<UpgradeMenuText>,
         )>,
     >,
     maze_entities: Query<Entity, Or<(With<Wall>, With<Floor>, With<Roof>, With<FogCell>)>>,
@@ -548,20 +747,13 @@ fn spawn_treasures(
     let mut treasure_cells = Vec::new();
     let mut spawned = 0;
 
-    if let Some(starter_cell) = open_neighbors(start_cell, maze)
-        .into_iter()
-        .find(|cell| *cell != exit_cell)
-    {
-        treasure_cells.push(starter_cell);
-        info!("Starter treasure at cell {:?}", starter_cell);
-    }
-
     for z in 0..MAZE_ROWS {
         for x in 0..MAZE_COLUMNS {
             if (x, z) == start_cell || (x, z) == exit_cell {
                 continue;
             }
-            if treasure_cells.contains(&(x, z)) {
+            let spawn_distance = start_cell.0.abs_diff(x) + start_cell.1.abs_diff(z);
+            if spawn_distance <= 2 || treasure_cells.contains(&(x, z)) {
                 continue;
             }
 
@@ -609,6 +801,121 @@ fn open_neighbors(cell: (usize, usize), maze: &MazeMap) -> Vec<(usize, usize)> {
         .collect()
 }
 
+fn best_spawn_direction(cell: (usize, usize), maze: &MazeMap) -> Direction {
+    let mut best_direction = Direction::North;
+    let mut best_score = 0;
+    let mut found_opening = false;
+
+    for (direction, _, _) in cardinal_directions() {
+        if maze.cells[cell.1][cell.0].walls[direction.index()] {
+            continue;
+        }
+
+        let Some(next) = neighbor_cell(cell, direction) else {
+            continue;
+        };
+        if maze.cells[next.1][next.0].walls[direction.opposite().index()] {
+            continue;
+        }
+
+        let score = spawn_direction_score(cell, next, maze);
+        if !found_opening || score > best_score {
+            found_opening = true;
+            best_direction = direction;
+            best_score = score;
+        }
+    }
+
+    best_direction
+}
+
+fn spawn_direction_score(
+    origin: (usize, usize),
+    first_cell: (usize, usize),
+    maze: &MazeMap,
+) -> u32 {
+    let mut visited = [[false; MAZE_COLUMNS]; MAZE_ROWS];
+    let mut queue = VecDeque::new();
+    let mut score = 0;
+
+    visited[origin.1][origin.0] = true;
+    visited[first_cell.1][first_cell.0] = true;
+    queue.push_back((first_cell, 1_u32));
+
+    while let Some((cell, depth)) = queue.pop_front() {
+        score += 7_u32.saturating_sub(depth);
+        if depth >= 6 {
+            continue;
+        }
+
+        for next in open_neighbors(cell, maze) {
+            if visited[next.1][next.0] {
+                continue;
+            }
+            visited[next.1][next.0] = true;
+            queue.push_back((next, depth + 1));
+        }
+    }
+
+    score
+}
+
+fn route_between(
+    start: (usize, usize),
+    goal: (usize, usize),
+    maze: &MazeMap,
+) -> Option<Vec<(usize, usize)>> {
+    let mut visited = [[false; MAZE_COLUMNS]; MAZE_ROWS];
+    let mut previous = [[None; MAZE_COLUMNS]; MAZE_ROWS];
+    let mut queue = VecDeque::new();
+    visited[start.1][start.0] = true;
+    queue.push_back(start);
+
+    while let Some(cell) = queue.pop_front() {
+        if cell == goal {
+            let mut route = vec![goal];
+            let mut current = goal;
+            while current != start {
+                current = previous[current.1][current.0]?;
+                route.push(current);
+            }
+            route.reverse();
+            return Some(route);
+        }
+
+        for next in open_neighbors(cell, maze) {
+            if visited[next.1][next.0] {
+                continue;
+            }
+            visited[next.1][next.0] = true;
+            previous[next.1][next.0] = Some(cell);
+            queue.push_back(next);
+        }
+    }
+
+    None
+}
+
+fn key_cell_on_exit_route(
+    start_cell: (usize, usize),
+    exit_cell: (usize, usize),
+    maze: &MazeMap,
+) -> (usize, usize) {
+    if let Some(route) = route_between(start_cell, exit_cell, maze) {
+        let furthest_index = route.len().saturating_sub(2);
+        if furthest_index > 0 {
+            let min_index = furthest_index.min(7);
+            let preferred_index = ((route.len() * 3) / 5).clamp(min_index, furthest_index);
+            return route[preferred_index];
+        }
+    }
+
+    open_neighbors(start_cell, maze)
+        .into_iter()
+        .find(|cell| *cell != exit_cell)
+        .unwrap_or(start_cell)
+}
+
 fn spawn_key_door_and_chests(
     commands: &mut Commands,
     maze: &MazeMap,
@@ -616,18 +923,15 @@ fn spawn_key_door_and_chests(
     game_assets: &GameAssets,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-) {
+) -> u32 {
     let start_cell = world_to_cell(start_position).unwrap_or((0, 0));
     let exit_cell = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
-    let key_cell = open_neighbors(start_cell, maze)
-        .into_iter()
-        .find(|cell| *cell != exit_cell)
-        .unwrap_or(start_cell);
+    let key_cell = key_cell_on_exit_route(start_cell, exit_cell, maze);
     let key_center = cell_center(key_cell.0, key_cell.1);
     commands.spawn((
         Sprite::from_image(game_assets.key.clone()),
         item_sprite(2.6),
-        Transform::from_xyz(key_center.x + 18.0, 2.0, key_center.y),
+        Transform::from_xyz(key_center.x, 2.0, key_center.y),
         KeyPickup,
         Billboard,
     ));
@@ -638,26 +942,26 @@ fn spawn_key_door_and_chests(
             let door_center = edge_center(door_neighbor, door_direction);
             let vertical = matches!(door_direction, Direction::East | Direction::West);
             let door_mesh = if vertical {
-                meshes.add(Cuboid::new(8.0, 62.0, 56.0))
+                meshes.add(Cuboid::new(2.0, 50.0, 78.0))
             } else {
-                meshes.add(Cuboid::new(56.0, 62.0, 8.0))
+                meshes.add(Cuboid::new(78.0, 50.0, 2.0))
             };
             let half_extents = if vertical {
-                Vec2::new(4.0, 28.0)
+                Vec2::new(2.0, 39.0)
             } else {
-                Vec2::new(28.0, 4.0)
+                Vec2::new(39.0, 2.0)
             };
             let door_material = materials.add(StandardMaterial {
                 base_color_texture: Some(game_assets.locked_door.clone()),
                 base_color: Color::WHITE,
-                emissive: LinearRgba::rgb(0.0, 0.02, 0.12),
-                perceptual_roughness: 0.35,
+                perceptual_roughness: 1.0,
+                unlit: true,
                 ..default()
             });
             commands.spawn((
                 Mesh3d(door_mesh),
                 MeshMaterial3d(door_material),
-                Transform::from_xyz(door_center.x, 31.0, door_center.y),
+                Transform::from_xyz(door_center.x, 25.0, door_center.y),
                 WallCollider {
                     center: door_center,
                     half_extents,
@@ -695,6 +999,7 @@ fn spawn_key_door_and_chests(
         }
     }
     info!("Spawned {spawned_chests} chests");
+    spawned_chests * 2
 }
 
 fn item_sprite(pixels_per_metre: f32) -> Sprite3d {
@@ -744,7 +1049,7 @@ fn collect_treasure(
 fn collect_ore(
     mut commands: Commands,
     player_query: Query<&Transform, With<Player>>,
-    ore_query: Query<(Entity, &Transform, &Ore)>,
+    ore_query: Query<(Entity, &Transform, &Ore), Without<OreBurst>>,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
 ) {
@@ -851,15 +1156,21 @@ fn open_chest(
     }
 }
 
-fn update_hud(run_state: Res<RunState>, mut hud_query: Query<&mut Text, With<HudText>>) {
+fn update_hud(
+    run_state: Res<RunState>,
+    mut hud_query: Query<&mut Text, With<HudText>>,
+    mut upgrade_menu_query: Query<&mut Text, (With<UpgradeMenuText>, Without<HudText>)>,
+) {
     if !run_state.is_changed() {
         return;
     }
 
-    let Ok(mut text) = hud_query.single_mut() else {
-        return;
-    };
-    text.0 = hud_text(&run_state);
+    if let Ok(mut text) = hud_query.single_mut() {
+        text.0 = hud_text(&run_state);
+    }
+    if let Ok(mut text) = upgrade_menu_query.single_mut() {
+        text.0 = upgrade_menu_text(&run_state);
+    }
 }
 
 fn hud_text(run_state: &RunState) -> String {
@@ -868,10 +1179,10 @@ fn hud_text(run_state: &RunState) -> String {
     } else if run_state.caught_by_rat {
         "Caught by the rat!"
     } else {
-        "Find the smiley exit"
+        "Find the exit"
     };
     format!(
-        "Treasure: {}/{}  Ore: {}  Keys: {}  Energy: {}/{}\nPickaxe: {}  Mined: {}  Time: {:.0}s\nScore: {}  Best: {}\nQ/E: turn  T: marker  F: mine  U: upgrade{}\n{}",
+        "Treasure: {}/{}  Ore: {}  Keys: {}  Energy: {}/{}\nMining: {}  Speed: {}  Mined: {}  Time: {:.0}s\nScore: {}  Best: {}\nQ/E: turn  T: marker  F: mine  U: upgrades{}\n{}",
         run_state.treasure,
         run_state.total_treasure,
         run_state.ore,
@@ -879,6 +1190,7 @@ fn hud_text(run_state: &RunState) -> String {
         run_state.energy,
         run_state.max_energy,
         run_state.pickaxe_level,
+        run_state.speed_level,
         run_state.mined_walls,
         run_state.elapsed_seconds,
         run_state.score,
@@ -892,31 +1204,96 @@ fn hud_text(run_state: &RunState) -> String {
     )
 }
 
+fn upgrade_menu_text(run_state: &RunState) -> String {
+    if !run_state.upgrade_menu_open {
+        return String::new();
+    }
+
+    let mining_prefix = if run_state.upgrade_selection == 0 {
+        ">"
+    } else {
+        " "
+    };
+    let speed_prefix = if run_state.upgrade_selection == 1 {
+        ">"
+    } else {
+        " "
+    };
+    format!(
+        "UPGRADES\nOre: {}\n\n{} Mining energy\n  Cost: {} ore\n  Level: {} -> {}\n\n{} Movement speed\n  Cost: {} ore\n  Level: {} -> {}\n\nUp/Down select\nEnter buy\nU/Esc close",
+        run_state.ore,
+        mining_prefix,
+        upgrade_cost(run_state.pickaxe_level),
+        run_state.pickaxe_level,
+        run_state.pickaxe_level + 1,
+        speed_prefix,
+        upgrade_cost(run_state.speed_level),
+        run_state.speed_level,
+        run_state.speed_level + 1,
+    )
+}
+
+fn upgrade_cost(level: u32) -> u32 {
+    level.saturating_mul(2)
+}
+
 fn upgrade_pickaxe(
     keyboard: Res<ButtonInput<KeyCode>>,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
     mut commands: Commands,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyU) || run_state.won || run_state.caught_by_rat {
+    if run_state.won || run_state.caught_by_rat {
         return;
     }
 
-    let cost = run_state.pickaxe_level;
-    if run_state.ore < cost {
-        info!("Need {cost} ore to upgrade pickaxe");
+    if keyboard.just_pressed(KeyCode::KeyU) {
+        run_state.upgrade_menu_open = !run_state.upgrade_menu_open;
+        return;
+    }
+    if !run_state.upgrade_menu_open {
+        return;
+    }
+    if keyboard.just_pressed(KeyCode::Escape) {
+        run_state.upgrade_menu_open = false;
+        return;
+    }
+    if keyboard.just_pressed(KeyCode::ArrowUp) || keyboard.just_pressed(KeyCode::ArrowDown) {
+        run_state.upgrade_selection = 1 - run_state.upgrade_selection;
+        return;
+    }
+    if !keyboard.just_pressed(KeyCode::Enter) && !keyboard.just_pressed(KeyCode::Space) {
         return;
     }
 
-    run_state.ore -= cost;
-    run_state.pickaxe_level += 1;
-    run_state.max_energy += 1;
-    run_state.energy = run_state.max_energy;
-    play_sound(&mut commands, game_assets.upgrade_sound.clone());
-    info!(
-        "Upgraded pickaxe to level {}; max energy {}",
-        run_state.pickaxe_level, run_state.max_energy
-    );
+    if run_state.upgrade_selection == 0 {
+        let cost = upgrade_cost(run_state.pickaxe_level);
+        if run_state.ore < cost {
+            info!("Need {cost} ore to upgrade mining energy");
+            return;
+        }
+
+        run_state.ore -= cost;
+        run_state.pickaxe_level += 1;
+        run_state.max_energy += 1;
+        run_state.energy = run_state.max_energy;
+        play_sound(&mut commands, game_assets.upgrade_sound.clone());
+        info!(
+            "Upgraded mining to level {}; max energy {}",
+            run_state.pickaxe_level, run_state.max_energy
+        );
+    } else {
+        let cost = upgrade_cost(run_state.speed_level);
+        if run_state.ore < cost {
+            info!("Need {cost} ore to upgrade speed");
+            return;
+        }
+
+        run_state.ore -= cost;
+        run_state.speed_level += 1;
+        play_sound(&mut commands, game_assets.upgrade_sound.clone());
+        info!("Upgraded speed to level {}", run_state.speed_level);
+    }
 }
 
 fn mine_wall(
@@ -924,10 +1301,17 @@ fn mine_wall(
     player_query: Query<&Transform, With<Player>>,
     orbit: Res<CameraOrbit>,
     mut maze: ResMut<MazeMap>,
-    wall_query: Query<(Entity, &WallSegment, &WallCollider)>,
-    mining_assets: Res<MiningAssets>,
+    mut wall_query: Query<(
+        Entity,
+        &mut WallSegment,
+        &WallCollider,
+        &mut MeshMaterial3d<StandardMaterial>,
+        &Transform,
+    )>,
+    hard_wall_assets: Res<HardWallAssets>,
     game_assets: Res<GameAssets>,
     mut run_state: ResMut<RunState>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut commands: Commands,
 ) {
     if !keyboard.just_pressed(KeyCode::KeyF) {
@@ -954,9 +1338,10 @@ fn mine_wall(
         return;
     }
 
-    let Some((entity, segment, collider)) = wall_query
-        .iter()
-        .find(|(_, segment, _)| same_wall_edge(segment.cell, segment.direction, cell, direction))
+    let Some((entity, mut segment, collider, mut material, transform)) =
+        wall_query.iter_mut().find(|(_, segment, _, _, _)| {
+            same_wall_edge(segment.cell, segment.direction, cell, direction)
+        })
     else {
         info!(
             "No wall entity found at cell {:?} facing {:?}",
@@ -971,28 +1356,111 @@ fn mine_wall(
         return;
     }
 
+    run_state.energy -= 1;
+    play_sound(&mut commands, game_assets.mine_sound.clone());
+
+    if segment.hits_remaining > 1 {
+        segment.hits_remaining -= 1;
+        let crack_index = (segment.max_hits - segment.hits_remaining) as usize;
+        let texture = hard_wall_assets.textures[crack_index.min(2)].clone();
+        *material = MeshMaterial3d(materials.add(StandardMaterial {
+            base_color_texture: Some(texture),
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.9,
+            ..default()
+        }));
+        commands.entity(entity).insert(WallShake {
+            timer: Timer::from_seconds(0.22, TimerMode::Once),
+            original: transform.translation,
+        });
+        info!(
+            "Cracked hard wall at cell {:?}; {} hits remaining",
+            cell, segment.hits_remaining
+        );
+        return;
+    }
+
+    let ore_deposit = segment.ore_deposit;
+    let ore_spawn_center = collider.center;
     commands.entity(entity).despawn();
     maze.cells[cell.1][cell.0].walls[direction.index()] = false;
     if let Some(neighbor) = neighbor_cell(cell, direction) {
         maze.cells[neighbor.1][neighbor.0].walls[direction.opposite().index()] = false;
     }
-    commands.spawn((
-        Sprite::from_image(mining_assets.ore_image.clone()),
-        item_sprite(2.4),
-        Transform::from_xyz(collider.center.x, 2.0, collider.center.y),
-        Ore {
-            value: run_state.pickaxe_level,
-        },
-        Billboard,
-    ));
-    run_state.energy -= 1;
+    if ore_deposit {
+        spawn_ore_burst(
+            &mut commands,
+            game_assets.ore.clone(),
+            ore_spawn_center,
+            direction,
+        );
+    }
     run_state.mined_walls += 1;
-    play_sound(&mut commands, game_assets.mine_sound.clone());
     info!(
         "Mined wall at cell {:?} facing {:?}",
         cell,
         direction.index()
     );
+}
+
+fn spawn_ore_burst(
+    commands: &mut Commands,
+    image: Handle<Image>,
+    center: Vec2,
+    wall_direction: Direction,
+) {
+    let mut rng = rand::thread_rng();
+    let count = rng.gen_range(2..=4);
+    let (dx, dz) = wall_direction.delta();
+    let outward = Vec3::new(dx as f32, 0.0, dz as f32).normalize_or_zero();
+
+    for _ in 0..count {
+        let sideways = Vec3::new(outward.z, 0.0, -outward.x) * rng.gen_range(-35.0..=35.0);
+        let velocity = outward * rng.gen_range(70.0..=120.0)
+            + sideways
+            + Vec3::Y * rng.gen_range(95.0..=145.0);
+        commands.spawn((
+            Sprite::from_image(image.clone()),
+            item_sprite(2.4),
+            Transform::from_xyz(center.x, 18.0, center.y),
+            Ore { value: 1 },
+            OreBurst {
+                velocity,
+                timer: Timer::from_seconds(0.95, TimerMode::Once),
+            },
+            Billboard,
+        ));
+    }
+    info!("Ore deposit burst {count} ore nuggets");
+}
+
+fn update_ore_bursts(
+    time: Res<Time>,
+    mut query: Query<(Entity, &mut Transform, &mut OreBurst)>,
+    mut commands: Commands,
+) {
+    let dt = time.delta_secs();
+    for (entity, mut transform, mut burst) in query.iter_mut() {
+        burst.timer.tick(time.delta());
+        burst.velocity.y -= 360.0 * dt;
+        transform.translation += burst.velocity * dt;
+
+        if transform.translation.y <= 2.0 {
+            transform.translation.y = 2.0;
+            if burst.velocity.y < -18.0 && !burst.timer.is_finished() {
+                burst.velocity.y = -burst.velocity.y * 0.34;
+                burst.velocity.x *= 0.72;
+                burst.velocity.z *= 0.72;
+            } else {
+                commands.entity(entity).remove::<OreBurst>();
+            }
+        }
+
+        if burst.timer.is_finished() {
+            transform.translation.y = 2.0;
+            commands.entity(entity).remove::<OreBurst>();
+        }
+    }
 }
 
 fn facing_direction(yaw: f32) -> Direction {
@@ -1010,6 +1478,15 @@ fn facing_direction(yaw: f32) -> Direction {
     }
 }
 
+fn yaw_for_direction(direction: Direction) -> f32 {
+    match direction {
+        Direction::North => std::f32::consts::PI,
+        Direction::East => std::f32::consts::FRAC_PI_2 * 3.0,
+        Direction::South => 0.0,
+        Direction::West => std::f32::consts::FRAC_PI_2,
+    }
+}
+
 fn same_wall_edge(
     segment_cell: (usize, usize),
     segment_direction: Direction,
@@ -1023,6 +1500,23 @@ fn same_wall_edge(
     neighbor_cell(cell, direction).is_some_and(|neighbor| {
         segment_cell == neighbor && segment_direction == direction.opposite()
     })
+}
+
+fn update_wall_shake(
+    time: Res<Time>,
+    mut query: Query<(Entity, &mut Transform, &mut WallShake)>,
+    mut commands: Commands,
+) {
+    for (entity, mut transform, mut shake) in query.iter_mut() {
+        shake.timer.tick(time.delta());
+        let remaining = 1.0 - shake.timer.fraction();
+        let wobble = (shake.timer.elapsed_secs() * 95.0).sin() * 3.0 * remaining;
+        transform.translation = shake.original + Vec3::new(wobble, 0.0, 0.0);
+        if shake.timer.is_finished() {
+            transform.translation = shake.original;
+            commands.entity(entity).remove::<WallShake>();
+        }
+    }
 }
 
 fn neighbor_cell(cell: (usize, usize), direction: Direction) -> Option<(usize, usize)> {
@@ -1103,7 +1597,7 @@ fn check_exit_reached(
     if player_xz.distance(exit_xz) < 32.0 {
         run_state.won = true;
         play_sound(&mut commands, game_assets.win_sound.clone());
-        info!("You found the smiley face exit!");
+        info!("You found the exit!");
     }
 }
 
@@ -1169,6 +1663,76 @@ fn rat_movement(
         let movement = to_target.normalize() * step.min(distance);
         transform.translation += movement;
         transform.rotation = Quat::from_rotation_y(movement.x.atan2(movement.z));
+    }
+}
+
+fn rat_squeaks(
+    time: Res<Time>,
+    maze: Res<MazeMap>,
+    player_query: Query<&Transform, (With<Player>, Without<Rat>)>,
+    mut rat_query: Query<(&Transform, &mut Rat)>,
+    game_assets: Res<GameAssets>,
+    run_state: Res<RunState>,
+    mut commands: Commands,
+) {
+    if run_state.won || run_state.caught_by_rat {
+        return;
+    }
+
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+    let Some(player_cell) = world_to_cell(player_transform.translation) else {
+        return;
+    };
+
+    let mut rng = rand::thread_rng();
+    for (rat_transform, mut rat) in rat_query.iter_mut() {
+        rat.squeak_timer.tick(time.delta());
+        if !rat.squeak_timer.is_finished() {
+            continue;
+        }
+
+        let route_steps = route_between(player_cell, rat.cell, &maze)
+            .map(|route| route.len().saturating_sub(1) as f32)
+            .unwrap_or(18.0);
+        let direct_steps =
+            player_cell.0.abs_diff(rat.cell.0) as f32 + player_cell.1.abs_diff(rat.cell.1) as f32;
+        let distance_t = (route_steps / 12.0).clamp(0.0, 1.0);
+        let next_interval = 0.12 + distance_t.powf(1.1) * 3.9 + rng.gen_range(-0.04..=0.28);
+        rat.squeak_timer = Timer::from_seconds(next_interval.max(0.1), TimerMode::Once);
+
+        let wall_muffle = if route_steps > direct_steps + 2.0 {
+            0.9
+        } else {
+            1.0
+        };
+        let use_echo = route_steps >= 4.0 || route_steps > direct_steps + 1.5;
+        let sound = if use_echo {
+            game_assets.rat_squeak_echo_sound.clone()
+        } else {
+            game_assets.rat_squeak_sound.clone()
+        };
+        let volume = if use_echo {
+            (0.58 - distance_t * 0.12) * wall_muffle
+        } else {
+            (1.05 - distance_t * 0.22) * wall_muffle
+        };
+        let speed = if use_echo {
+            rng.gen_range(0.82..=0.96)
+        } else {
+            rng.gen_range(0.96..=1.14)
+        };
+        let spatial_scale = if use_echo { 0.008 } else { 0.018 };
+        commands.spawn((
+            AudioPlayer(sound),
+            PlaybackSettings::DESPAWN
+                .with_volume(Volume::Linear(volume.clamp(0.26, 1.0)))
+                .with_speed(speed)
+                .with_spatial(true)
+                .with_spatial_scale(SpatialScale::new(spatial_scale)),
+            *rat_transform,
+        ));
     }
 }
 
@@ -1274,7 +1838,7 @@ fn camera_drag(
     time: Res<Time>,
     mut orbit: ResMut<CameraOrbit>,
 ) {
-    let keyboard_rotation = 2.4 * time.delta_secs();
+    let keyboard_rotation = 3.8 * time.delta_secs();
     if keyboard.pressed(KeyCode::KeyQ) {
         orbit.yaw = (orbit.yaw + keyboard_rotation).rem_euclid(std::f32::consts::TAU);
     }
@@ -1293,7 +1857,7 @@ fn camera_drag(
         return;
     }
 
-    let sensitivity = 0.006;
+    let sensitivity = 0.01;
     orbit.yaw = (orbit.yaw - total_motion.x * sensitivity).rem_euclid(std::f32::consts::TAU);
     orbit.pitch = (orbit.pitch + total_motion.y * sensitivity).clamp(-0.65, 0.75);
 }
@@ -1388,7 +1952,7 @@ fn player_movement(
 
     direction = direction.normalize();
 
-    let speed = 105.0;
+    let speed = 105.0 + (run_state.speed_level.saturating_sub(1) as f32 * 20.0);
     let delta = direction * speed * time.delta_secs();
     let radius = 15.0;
 
@@ -1505,30 +2069,7 @@ fn update_fog(
 
     let mut alpha = [[0.92_f32; MAZE_COLUMNS]; MAZE_ROWS];
     let mut visible = [[false; MAZE_COLUMNS]; MAZE_ROWS];
-    reveal_cell(origin, &mut visible, &mut alpha, &mut fog_memory);
-
-    for (direction, dx, dz) in cardinal_directions() {
-        let mut current = origin;
-        loop {
-            if maze.cells[current.1][current.0].walls[direction.index()] {
-                break;
-            }
-
-            let nx = current.0 as isize + dx;
-            let nz = current.1 as isize + dz;
-            if nx < 0 || nz < 0 || nx >= MAZE_COLUMNS as isize || nz >= MAZE_ROWS as isize {
-                break;
-            }
-
-            let next = (nx as usize, nz as usize);
-            if maze.cells[next.1][next.0].walls[direction.opposite().index()] {
-                break;
-            }
-
-            reveal_cell(next, &mut visible, &mut alpha, &mut fog_memory);
-            current = next;
-        }
-    }
+    reveal_visible_area(origin, &maze, &mut visible, &mut alpha, &mut fog_memory);
 
     for z in 0..MAZE_ROWS {
         for x in 0..MAZE_COLUMNS {
@@ -1582,6 +2123,34 @@ fn reveal_cell(
     visible[cell.1][cell.0] = true;
     fog_memory.seen[cell.1][cell.0] = true;
     alpha[cell.1][cell.0] = 0.02;
+}
+
+fn reveal_visible_area(
+    origin: (usize, usize),
+    maze: &MazeMap,
+    visible: &mut [[bool; MAZE_COLUMNS]; MAZE_ROWS],
+    alpha: &mut [[f32; MAZE_COLUMNS]; MAZE_ROWS],
+    fog_memory: &mut FogMemory,
+) {
+    let mut visited = [[false; MAZE_COLUMNS]; MAZE_ROWS];
+    let mut queue = VecDeque::new();
+    visited[origin.1][origin.0] = true;
+    queue.push_back((origin, 0usize));
+
+    while let Some((cell, distance)) = queue.pop_front() {
+        reveal_cell(cell, visible, alpha, fog_memory);
+        if distance >= 3 {
+            continue;
+        }
+
+        for next in open_neighbors(cell, maze) {
+            if visited[next.1][next.0] {
+                continue;
+            }
+            visited[next.1][next.0] = true;
+            queue.push_back((next, distance + 1));
+        }
+    }
 }
 
 fn cardinal_directions() -> [(Direction, isize, isize); 4] {

@@ -36,6 +36,9 @@ pub struct WallSegment {
     pub cell: (usize, usize),
     pub direction: Direction,
     pub mineable: bool,
+    pub hits_remaining: u8,
+    pub max_hits: u8,
+    pub ore_deposit: bool,
 }
 
 #[derive(Resource, Clone)]
@@ -103,12 +106,15 @@ impl Direction {
 pub fn create_maze(
     commands: &mut Commands,
     wall_texture: Handle<Image>,
+    ore_wall_texture: Handle<Image>,
+    hard_wall_textures: [Handle<Image>; 3],
     floor_texture: Handle<Image>,
     roof_texture: Handle<Image>,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) -> (Vec3, MazeMap) {
-    let maze = generate_connected_maze();
+    let mut maze = generate_connected_maze();
+    seal_extra_exit_passages(&mut maze);
     let maze_map = MazeMap { cells: maze };
     commands.insert_resource(maze_map.clone());
 
@@ -117,6 +123,20 @@ pub fn create_maze(
         base_color: Color::WHITE,
         perceptual_roughness: 0.85,
         ..default()
+    });
+    let ore_wall_material = materials.add(StandardMaterial {
+        base_color_texture: Some(ore_wall_texture),
+        base_color: Color::WHITE,
+        perceptual_roughness: 0.85,
+        ..default()
+    });
+    let hard_wall_materials = hard_wall_textures.map(|texture| {
+        materials.add(StandardMaterial {
+            base_color_texture: Some(texture),
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.9,
+            ..default()
+        })
     });
     let floor_material = materials.add(StandardMaterial {
         base_color_texture: Some(floor_texture),
@@ -144,6 +164,8 @@ pub fn create_maze(
         WALL_HEIGHT,
         CELL_SIZE + WALL_THICKNESS,
     ));
+    let ore_deposit_edges = choose_ore_deposit_edges(&maze);
+    info!("Spawned {} ore deposit walls", ore_deposit_edges.len());
 
     for z in 0..MAZE_ROWS {
         for x in 0..MAZE_COLUMNS {
@@ -180,28 +202,48 @@ pub fn create_maze(
 
             let cell = maze[z][x];
             if cell.walls[Direction::North.index()] {
+                let hard = hard_wall_near_exit((x, z), Direction::North);
+                let ore_deposit = !hard && ore_deposit_edges.contains(&((x, z), Direction::North));
                 spawn_wall(
                     commands,
                     horizontal_wall_mesh.clone(),
-                    wall_material.clone(),
+                    if hard {
+                        hard_wall_materials[0].clone()
+                    } else if ore_deposit {
+                        ore_wall_material.clone()
+                    } else {
+                        wall_material.clone()
+                    },
                     Vec2::new(center.x, center.y + CELL_SIZE * 0.5),
                     Vec2::new((CELL_SIZE + WALL_THICKNESS) * 0.5, WALL_THICKNESS * 0.5),
                     (x, z),
                     Direction::North,
                     z < MAZE_ROWS - 1,
+                    if hard { 3 } else { 1 },
+                    ore_deposit,
                     false,
                 );
             }
             if cell.walls[Direction::West.index()] {
+                let hard = hard_wall_near_exit((x, z), Direction::West);
+                let ore_deposit = !hard && ore_deposit_edges.contains(&((x, z), Direction::West));
                 spawn_wall(
                     commands,
                     vertical_wall_mesh.clone(),
-                    wall_material.clone(),
+                    if hard {
+                        hard_wall_materials[0].clone()
+                    } else if ore_deposit {
+                        ore_wall_material.clone()
+                    } else {
+                        wall_material.clone()
+                    },
                     Vec2::new(center.x - CELL_SIZE * 0.5, center.y),
                     Vec2::new(WALL_THICKNESS * 0.5, (CELL_SIZE + WALL_THICKNESS) * 0.5),
                     (x, z),
                     Direction::West,
                     x > 0,
+                    if hard { 3 } else { 1 },
+                    ore_deposit,
                     true,
                 );
             }
@@ -215,6 +257,8 @@ pub fn create_maze(
                     (x, z),
                     Direction::South,
                     false,
+                    1,
+                    false,
                     false,
                 );
             }
@@ -227,6 +271,8 @@ pub fn create_maze(
                     Vec2::new(WALL_THICKNESS * 0.5, (CELL_SIZE + WALL_THICKNESS) * 0.5),
                     (x, z),
                     Direction::East,
+                    false,
+                    1,
                     false,
                     true,
                 );
@@ -267,8 +313,11 @@ fn spawn_wall(
     cell: (usize, usize),
     direction: Direction,
     mineable: bool,
+    hits_required: u8,
+    ore_deposit: bool,
     vertical: bool,
 ) {
+    let hits_required = hits_required.max(1);
     commands.spawn((
         Mesh3d(mesh),
         MeshMaterial3d(material),
@@ -282,12 +331,155 @@ fn spawn_wall(
             cell,
             direction,
             mineable,
+            hits_remaining: hits_required,
+            max_hits: hits_required,
+            ore_deposit,
         },
     ));
 
     if vertical {
         debug!("spawned vertical wall at {:?}", center);
     }
+}
+
+fn choose_ore_deposit_edges(
+    maze: &[[MazeCell; MAZE_COLUMNS]; MAZE_ROWS],
+) -> Vec<((usize, usize), Direction)> {
+    let mut candidates = Vec::new();
+    let start = (0_usize, 0_usize);
+
+    for z in 0..MAZE_ROWS {
+        for x in 0..MAZE_COLUMNS {
+            for direction in [Direction::North, Direction::West] {
+                if !maze[z][x].walls[direction.index()] || hard_wall_near_exit((x, z), direction) {
+                    continue;
+                }
+                let Some(neighbor) = neighbor_cell((x, z), direction) else {
+                    continue;
+                };
+                if start.0.abs_diff(x) + start.1.abs_diff(z) <= 3
+                    || start.0.abs_diff(neighbor.0) + start.1.abs_diff(neighbor.1) <= 3
+                {
+                    continue;
+                }
+                candidates.push(((x, z), direction));
+            }
+        }
+    }
+
+    candidates.shuffle(&mut rand::thread_rng());
+    candidates.truncate(7);
+    candidates
+}
+
+fn seal_extra_exit_passages(maze: &mut [[MazeCell; MAZE_COLUMNS]; MAZE_ROWS]) {
+    let exit = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
+    let mut open_edges = Vec::new();
+
+    for direction in [
+        Direction::South,
+        Direction::West,
+        Direction::North,
+        Direction::East,
+    ] {
+        if maze[exit.1][exit.0].walls[direction.index()] {
+            continue;
+        }
+        let Some(neighbor) = neighbor_cell(exit, direction) else {
+            continue;
+        };
+        open_edges.push((direction, neighbor));
+    }
+
+    let Some((keep_direction, _)) = open_edges
+        .iter()
+        .copied()
+        .find(|(_, neighbor)| connects_to_start_without_exit(maze, *neighbor, exit))
+        .or_else(|| open_edges.first().copied())
+    else {
+        return;
+    };
+
+    for (direction, neighbor) in open_edges.into_iter().skip(1) {
+        maze[exit.1][exit.0].walls[direction.index()] = true;
+        maze[neighbor.1][neighbor.0].walls[direction.opposite().index()] = true;
+    }
+
+    info!(
+        "Exit chamber has one locked-door passage facing {:?}",
+        keep_direction.index()
+    );
+}
+
+fn connects_to_start_without_exit(
+    maze: &[[MazeCell; MAZE_COLUMNS]; MAZE_ROWS],
+    from: (usize, usize),
+    exit: (usize, usize),
+) -> bool {
+    let start = (0, 0);
+    let mut visited = [[false; MAZE_COLUMNS]; MAZE_ROWS];
+    let mut stack = vec![from];
+    visited[exit.1][exit.0] = true;
+
+    while let Some(cell) = stack.pop() {
+        if cell == start {
+            return true;
+        }
+        if visited[cell.1][cell.0] {
+            continue;
+        }
+        visited[cell.1][cell.0] = true;
+
+        for direction in [
+            Direction::North,
+            Direction::East,
+            Direction::South,
+            Direction::West,
+        ] {
+            if maze[cell.1][cell.0].walls[direction.index()] {
+                continue;
+            }
+            let Some(next) = neighbor_cell(cell, direction) else {
+                continue;
+            };
+            if maze[next.1][next.0].walls[direction.opposite().index()] || visited[next.1][next.0] {
+                continue;
+            }
+            stack.push(next);
+        }
+    }
+
+    false
+}
+
+fn neighbor_cell(cell: (usize, usize), direction: Direction) -> Option<(usize, usize)> {
+    let (dx, dz) = direction.delta();
+    let nx = cell.0 as isize + dx;
+    let nz = cell.1 as isize + dz;
+    if nx < 0 || nz < 0 || nx >= MAZE_COLUMNS as isize || nz >= MAZE_ROWS as isize {
+        return None;
+    }
+
+    Some((nx as usize, nz as usize))
+}
+
+fn hard_wall_near_exit(cell: (usize, usize), direction: Direction) -> bool {
+    let exit = (MAZE_COLUMNS - 1, MAZE_ROWS - 1);
+    if cell_near_exit(cell, exit) {
+        return true;
+    }
+
+    let (dx, dz) = direction.delta();
+    let nx = cell.0 as isize + dx;
+    let nz = cell.1 as isize + dz;
+    if nx < 0 || nz < 0 || nx >= MAZE_COLUMNS as isize || nz >= MAZE_ROWS as isize {
+        return false;
+    }
+    cell_near_exit((nx as usize, nz as usize), exit)
+}
+
+fn cell_near_exit(cell: (usize, usize), exit: (usize, usize)) -> bool {
+    cell.0.abs_diff(exit.0) + cell.1.abs_diff(exit.1) <= 1
 }
 
 fn generate_connected_maze() -> [[MazeCell; MAZE_COLUMNS]; MAZE_ROWS] {
